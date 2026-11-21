@@ -40,7 +40,8 @@
     "serve:updates": "node scripts/serve-updates.mjs",
     "notice": "node tools/notice-studio/studio.mjs",
     "icons": "electron scripts/make-icons.cjs",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "打包": "npm run build && node scripts/package-portable.mjs"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6.20.3",
