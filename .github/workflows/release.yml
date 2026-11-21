@@ -1,0 +1,86 @@
+# 检测到发布标签（v*）自动构建便携包并发布到 GitHub Release；也支持在 Actions 页手动运行。
+#
+# 打包方式：npm run 打包 → 构建（发布模式）+ node scripts/package-portable.mjs → release/Unyra-<版本>-portable.tar.xz
+# 便携包不含 Electron/Node 运行时（运行需目标机器自备 electron），所以一份 ubuntu 构建即跨平台通用。
+# 注：Windows 专属的原生助手 screenHelper.exe 只在 Windows 上编译；在 ubuntu 构建的包里不含它
+#     （应用内 F1 截图快捷键仍可用，仅"任意应用里按 F1 全局唤起"这个原生钩子缺失）。
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的 tag（留空则用 package.json 版本，如 v0.8.1）'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 构建并打便携包（发布模式：压缩、无 sourcemap）
+        run: npm run 打包
+        env:
+          MOJI_RELEASE: '1'
+
+      - name: 计算发布 tag
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            if [ "${{ github.ref_type }}" = "tag" ]; then
+              TAG="${{ github.ref_name }}"
+            else
+              TAG="v$(node -p "require('./package.json').version")"
+            fi
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "发布 tag: $TAG"
+
+      - name: 发布到 GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(release/*.tar.xz)
+          if [ ${#files[@]} -eq 0 ]; then echo "没有便携包产物" >&2; exit 1; fi
+
+          # 正文：有 release-notes/<tag>.md 就用，否则让 GitHub 按 PR 生成
+          notes=(--generate-notes)
+          [ -f "release-notes/$TAG.md" ] && notes=(--notes-file "release-notes/$TAG.md")
+
+          # 预发布（tag 带 `-`）不占 Latest
+          vis=(--latest)
+          case "$TAG" in *-*) vis=(--prerelease);; esac
+
+          if gh release view "$TAG" -R "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，补传/覆盖产物"
+            gh release upload "$TAG" "${files[@]}" --clobber -R "${{ github.repository }}"
+            gh release edit "$TAG" --title "归一 Unyra $TAG" "${vis[@]}" "${notes[@]}" -R "${{ github.repository }}"
+          else
+            gh release create "$TAG" "${files[@]}" \
+              --title "归一 Unyra $TAG" "${vis[@]}" "${notes[@]}" \
+              -R "${{ github.repository }}"
+          fi
+          echo "完成：${files[*]}"
