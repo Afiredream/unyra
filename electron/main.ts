@@ -33,6 +33,7 @@ import { registerMediaRelayProtocol } from './media-relay'
 import { startUpdateChecks } from './update'
 import { registerWebIpc } from './web'
 import { bootSingleInstance, initStartupTrace, lap } from './app/startup'
+import { listenDevQuit } from './app/devQuit'
 import { createWindow, mainWindow, showMainWindow } from './app/windows'
 import { setupWebBrowser } from './app/webSession'
 import { closeExamWindow } from './app/examWindow'
@@ -47,6 +48,7 @@ import { registerIpc } from './app/ipc'
 import { installLocalFileCsp } from './app/exportPdf'
 import { cleanupAllProcesses, registerBaseIpc } from './base/ipc'
 import { cleanupAllMcpSessions, registerMcpIpc } from './mcp/ipc'
+import { registerMcpServeIpc, startMcpServe } from './mcp/serve'
 import { registerLanIpc } from './lan/ipc'
 import { lanServer } from './lan/server'
 
@@ -67,6 +69,10 @@ function main(): void {
   // 全局兜底：未捕获异常只记日志，不静默崩掉整个应用
   process.on('uncaughtException', (err) => console.error('[main] uncaughtException:', err))
   process.on('unhandledRejection', (reason) => console.error('[main] unhandledRejection:', reason))
+
+  // dev 脚本的优雅停机通道（stdin 哨兵 → app.quit()，见 app/devQuit.ts）：
+  // 不挂它，dev 停 Electron 只能硬杀，缓存带脏页收摊、下次首启报 disk_cache 错
+  listenDevQuit()
 
   // 特权协议声明必须在 app ready 之前。
   // corsEnabled + supportFetchAPI + stream 三件套缺一不可：
@@ -98,6 +104,9 @@ function main(): void {
   registerVideoIpc()
   // 外部 MCP 服务的本地进程会话（stdio 传输，见 electron/mcp）：同样是「随时可能来问」
   registerMcpIpc()
+  // 对外 MCP 服务的管理通道（mcpServe:status / setEnabled，见 electron/mcp/serve）：
+  // 渲染层设置页随时可能来问，必须在 ready 前挂上
+  registerMcpServeIpc()
   // 局域网互联服务器与移动端文件传输（扫码直连与意图请求）
   registerLanIpc()
   lap('main:ipc')
@@ -146,6 +155,9 @@ function main(): void {
     installLocalFileCsp()
     installAppMenu()
     registerBaseIpc()
+    // 对外 MCP 服务（应用本身当 MCP server：命名管道 + 端点文件 + token 握手，见 electron/mcp/serve）。
+    // 管道先于窗口监听起来：界面还没就绪的调用会拿到可读的报错，而不是把外部 harness 挂着。
+    startMcpServe()
     // 内置浏览器的会话与守门（网页页签）：分区、UA 伪装、权限、弹窗与快捷键转发
     setupWebBrowser()
     /*

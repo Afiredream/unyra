@@ -7,6 +7,7 @@
  * - AgentTool：可注册的工具；新增能力只需实现一个工具并注册进 ToolRegistry
  */
 import type { ChatUsage } from '../ai/types'
+import type { AgentVoice } from './agentProfile'
 import type { DeliveryRecord } from './delivery'
 
 /** 会话里一条消息的组成片段：思考过程、正文回复、一次工具调用、一条运行时提示 */
@@ -35,6 +36,19 @@ export type AgentPart =
       text: string
     }
   | {
+      /**
+       * 委托交付的跳边界注入（team.complete，见 learn/agentTeam/delegations）：与
+       * prompt-module 同一条镜像纪律——runtime 在 hop 边界 push 一条 **user** 消息
+       * （pushInjection 对 user 角色恒不降级），宿主把交付全文记成本片段；toChatHistory
+       * 在它所在的位置补发一条 **恒为 user** 的消息（逐字节重放，见 agent/history）。
+       * 界面渲染成与思考/工具同层的折叠块。
+       */
+      type: 'team-delivery'
+      /** 交付所属的委托 id */
+      delegationId: string
+      text: string
+    }
+  | {
       type: 'tool'
       id: string
       name: string
@@ -52,7 +66,7 @@ export type AgentPart =
        */
       soft?: boolean
       /**
-       * 这次调用**附带回的图片**（如 execute 里 res.read 看了一张图）。
+       * 这次调用**附带回的图片**（如 execute 里看图 / 读图 api 附带了一张图）。
        * 字节在磁盘上，这里只有引用（见 MessageImage）。
        */
       images?: MessageImage[]
@@ -157,7 +171,7 @@ export interface ConversationMessage {
    */
   mark?: string
   /**
-   * 工作流启动时的**实参**（runWorkflow 的 params：如伪编译的 language/key/code）。
+   * 工作流启动时的**实参**（runWorkflow 的 params：如出卷的 examId / attemptId）。
    * 界面的工作流分界条展开时据此画「参数行」，并把指令里对应的实参高亮出来。
    * 只随隐藏指令落库；聊天轮没有它。
    */
@@ -322,7 +336,7 @@ export interface MessageImage {
   bytes: number
   /**
    * 像素尺寸。**可选**：用户贴进来的图在保存时就知道尺寸，而由资源库挂上来的图
-   * （Agent 用 res.read 看的那一张）只从清单里拿到字节数，不必为它多解码一次。
+   * （Agent 看图时附带的那些）只从清单里拿到字节数，不必为它多解码一次。
    */
   width?: number
   height?: number
@@ -346,6 +360,12 @@ export interface MessageQuote {
 export interface Conversation {
   id: string
   goalId: string
+  /**
+   * 这段对话属于哪位声部（agent team 的团队分工，见 agent/agentProfile）：
+   * 调度员 / 出卷师 / 设计师 / 调研员 / 维修员的承接会话在这里标身份；缺省 = 导师（老数据全部是导师对话；
+   * 已退役的判卷官 grader 载入时映射到命题官，见 agentProfile 的 LEGACY_VOICE_ALIAS）。
+   */
+  voice?: AgentVoice
   messages: ConversationMessage[]
   createdAt: number
   updatedAt: number

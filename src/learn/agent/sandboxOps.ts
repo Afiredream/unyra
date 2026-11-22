@@ -7,11 +7,11 @@
  */
 
 import type { AskAnswers, AskFormPayload, UiPointRequest, UiScrollRequest } from '../../agent/tools'
+import type { AgentProfileId, AgentVoice, AgentWfGrant } from '../../agent/agentProfile'
 import { createAgentOps, type AgentOps } from '../agentOps'
 import { examsOfNode } from '../graph'
 import type { LearnStore } from '../types'
-import { loadImageByRel } from '../static'
-import { readUserText, removeUserPath, userPath, writeUserText } from '../../lib/storage'
+import { userPath } from '../../lib/storage'
 import { native } from '../../lib/native'
 import { fetchForAgent, searchForAgent } from '../webSearch'
 import { tmpEntriesOf, withTmpEntries } from '../../lib/tmpStore'
@@ -25,6 +25,11 @@ export interface AgentRunTarget {
   /** 这一轮冲着哪个节点来：它是沙箱里的「当前节点」，也是考试工具作用的对象；无特定节点时为 null（纯目标级对话） */
   nodeId: string | null
   conversationId: string
+  /**
+   * 这一轮由哪位声部来说话（agent team 的团队分工，见 agent/agentProfile）：
+   * 决定系统提示词、api 能力面与工作流面；缺省 = 导师（老调用方零改动）。
+   */
+  voice?: AgentVoice
 }
 
 /**
@@ -64,6 +69,12 @@ export function learnSandboxOps(deps: {
   goalId: () => string
   /** wf.invoke 的落点（见 AgentOpsDeps.invokeWorkflow）：不注入时 wf.invoke 明说这里触发不了 */
   invokeWorkflow?: (ref: string, opts: { params?: Record<string, string | number> }) => unknown
+  /** wf.* 的授权面（智能体团队分工，见 AgentOpsDeps.workflowGrant）：缺省 = 不设限 */
+  workflowGrant?: AgentWfGrant
+  /** team.* 的委托发起方（执行声部的轮都有，见 AgentOpsDeps.teamFrom）：不注入就没有 team 这一组 */
+  teamFrom?: () => { conversationId: string; agent: AgentProfileId; goalId: string }
+  /** execute 通道的 api 组放行面（见 AgentOpsDeps.apiAllow）：不给 = 不设限 */
+  apiAllow?: readonly string[]
   /** 节点编辑成功后的宿主动作（出卷后的视觉自检等），由界面层注入 */
   afterNodeEdit?: (uuid: string, kind: string) => void
 }): AgentOps {
@@ -73,6 +84,9 @@ export function learnSandboxOps(deps: {
     nodeId: deps.nodeId,
     goalId: deps.goalId,
     ...(deps.invokeWorkflow ? { invokeWorkflow: deps.invokeWorkflow } : {}),
+    ...(deps.workflowGrant ? { workflowGrant: deps.workflowGrant } : {}),
+    ...(deps.teamFrom ? { teamFrom: deps.teamFrom } : {}),
+    ...(deps.apiAllow ? { apiAllow: deps.apiAllow } : {}),
     ...(deps.afterNodeEdit ? { afterNodeEdit: deps.afterNodeEdit } : {}),
     /*
      * 出题阶段闸门（节点通道的业务守卫）：当前节点有一次考试等着收尾（待判分、或
@@ -101,20 +115,8 @@ export function learnSandboxOps(deps: {
       return null
     },
     /**
-     * 资源库的磁盘能力。图片走 loadImageByRel：与聊天气泡共用同一份缓存，
-     * 同一张图既挂在消息里、又被文档引用时只读一次盘。
-     */
-    resourceIo: {
-      // 资源路径是「相对当前用户」的（docs/{目标}/static/…）：
-      // 这里必须用 *User* 那一组，否则文件会落到 {root}/docs 下、与清单分家
-      readText: readUserText,
-      writeText: writeUserText,
-      readImage: loadImageByRel,
-      remove: removeUserPath,
-    },
-    /**
      * 工作区目录的磁盘能力（users/<uid>/workspace/…，见 learn/workspace）：路径是
-     * 「相对当前用户」的，uid 前缀在这里补一次（与资源库同一条纪律）。直接走
+     * 「相对当前用户」的，uid 前缀在这里补一次（与用户存储同一纪律）。直接走
      * native 的 storage:list/read/write——错误原样透传，模型要靠它把路径改对。
      */
     workspaceIo: {

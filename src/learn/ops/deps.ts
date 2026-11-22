@@ -6,6 +6,7 @@
  */
 
 import type { SandboxOptions, WebOps } from '../../agent/tools'
+import type { AgentProfileId, AgentWfGrant } from '../../agent/agentProfile'
 import type { LearnStore, TmpEntry } from '../types'
 import type { UserProfile } from '../../user/types'
 import type { ProjectIo } from './project'
@@ -28,8 +29,6 @@ export interface AgentOpsDeps {
   tmp?: () => { nodeId?: string; entries: Record<string, TmpEntry>; onChange: (next: Record<string, TmpEntry>) => void }
   /** 出题 / 读卷 / 阅卷；不注入就没有 exam 这一组 */
   exam?: SandboxOptions['exam']
-  /** 资源库要碰磁盘；不注入就没有 res 这一组 */
-  resourceIo?: ResourceIo
   /** 工作区目录要碰磁盘（节点目录下的 workspace/，见 learn/workspace）；不注入就没有 workspace 这一组 */
   workspaceIo?: WorkspaceIo
   /**
@@ -43,7 +42,7 @@ export interface AgentOpsDeps {
   /**
    * 读网页（web.*）：不注入就没有这一组。
    *
-   * 与 ResourceIo / UserInfoIo 同一条道理——抓取要网络、落盘要 storage，
+   * 与 UserInfoIo 同一条道理——抓取要网络、落盘要 storage，
    * 这里只把界面层给的实现接上去，agentOps 自己仍然可以在 Node 里裸跑。
    */
   web?: WebOps
@@ -63,12 +62,31 @@ export interface AgentOpsDeps {
    * 不注入时 wf.invoke 回一句「这个执行环境触发不了」（超级文档的桥那一侧就是如此）。
    */
   invokeWorkflow?: (ref: string, opts: { params?: Record<string, string | number> }) => unknown
+  /**
+   * wf.* 的授权面（智能体团队分工，见 agent/agentProfile 的 AgentWfGrant）：
+   * builtin = 这位声部固定可触发的内置规程；registered = 登记条目的白名单
+   * （null = 全部可用，只对导师成立）。缺省 = 不设限（子代理 / 超级文档桥的老口径）。
+   * 越权触发在 invoke 当场拒绝并说明去哪儿放开。
+   */
+  workflowGrant?: AgentWfGrant
+  /**
+   * team.* 的委托发起方身份（执行声部的轮都有，见 learn/ops/team 与
+   * learn/agentTeam/delegations）：委托人 = 当前会话 + 它的声部与目标。
+   * 不注入就没有 team 这一组（子代理 / 超级文档桥 / 仅聊天都没有）。
+   */
+  teamFrom?: () => { conversationId: string; agent: AgentProfileId; goalId: string }
+  /**
+   * execute 通道的 api 组放行面（智能体团队分工的运行时清单，见 agent/agentProfile 的
+   * agentRuntimeApiAllow）：组名 + 放行的顶层函数名。不给 = 不设限
+   * （子代理 / 超级文档桥的老口径；导师之外的声音部都给）。
+   */
+  apiAllow?: readonly string[]
 }
 
 /**
  * 画像的读写能力（见 user/fields、user/store）。
  *
- * 与 ResourceIo 同样的道理：agentOps 要能在 Node 里裸跑（scripts/agent-ops.test.ts），
+ * 与 UserInfoIo 同样的道理：agentOps 要能在 Node 里裸跑（scripts/agent-ops.test.ts），
  * 所以「画像存在哪、怎么写盘」由界面层注入，这里只做校验与措辞。
  * update 回更新后的画像（写盘失败 / 没有当前用户时回 null）。
  */
@@ -78,24 +96,9 @@ export interface UserInfoIo {
 }
 
 /**
- * 资源库的磁盘能力：由界面层注入（见 components/learn/LearnWorkspace）。
- *
- * 之所以不让 agentOps 直接 import lib/storage：这个模块要能在 Node 里裸跑
- * （见 scripts/agent-ops.test.ts 的探针），注入之后磁盘那一层可以换成假的，
- * 「清单改了但文件没写」这类错也才测得出来。
- */
-export interface ResourceIo {
-  readText: (rel: string) => Promise<string | null>
-  writeText: (rel: string, content: string) => Promise<boolean>
-  /** 读一张图的字节（挂给模型看用）；读不到回 null */
-  readImage: (rel: string) => Promise<{ mime: string; data: string; url: string } | null>
-  remove: (rel: string) => Promise<boolean>
-}
-
-/**
  * 工作区目录的磁盘能力（workspace.*，见 learn/ops/workspace）：由界面层注入。
  *
- * 与 ResourceIo 同一条纪律：agentOps 要能在 Node 里裸跑（scripts/agent-ops.test.ts 的探针），
+ * 与 UserInfoIo 同一条纪律：agentOps 要能在 Node 里裸跑（scripts/agent-ops.test.ts 的探针），
  * 磁盘那一层可以换成假的。路径是「相对当前用户」的（docs/…/workspace/…），uid 前缀由实现补；
  * 结果形状与主进程的 storage:list/read/write 一致，错误原样透传给模型。
  */

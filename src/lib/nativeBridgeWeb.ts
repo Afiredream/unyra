@@ -205,6 +205,16 @@ export function createWebNativeBridge(): NativeBridge {
       stop: (serverId?: string) => apiFetch('/api/mcp/stop', { method: 'POST', body: JSON.stringify({ serverId }) }),
     },
 
+    // 对外 MCP 服务只在桌面端有（命名管道在主进程）：WebUI 模式安静空转，永远没有调用进来
+    mcpServe: {
+      onCall: () => () => {},
+      reply: () => {},
+      status: () =>
+        Promise.resolve({ enabled: false, listening: false, pipe: '', endpointFile: '', connections: 0, bridgePath: '', version: '' }),
+      setEnabled: (on) =>
+        Promise.resolve({ enabled: on === true, listening: false, pipe: '', endpointFile: '', connections: 0, bridgePath: '', version: '' }),
+    },
+
     plugins: {
       list: () => Promise.resolve({ ok: true, dir: '', entries: [] }),
       read: () => Promise.resolve({ ok: false, error: 'WebUI 模式暂不支持本地外部插件' }),
@@ -215,14 +225,6 @@ export function createWebNativeBridge(): NativeBridge {
       // 插件配置只存在于桌面端（safeStorage 在主进程）
       settingsGet: () => Promise.resolve({ ok: false, error: '插件配置仅桌面端可用' }),
       settingsSet: () => Promise.resolve({ ok: false, error: '插件配置仅桌面端可用' }),
-    },
-
-    runner: {
-      artifacts: () => Promise.resolve({ ok: true, items: {}, silent: {} }),
-      putArtifact: () => Promise.resolve({ ok: true }),
-      putSilent: () => Promise.resolve({ ok: true }),
-      clearArtifacts: () => Promise.resolve({ ok: true }),
-      fetch: (url, init) => apiFetch('/api/web/fetch', { method: 'POST', body: JSON.stringify({ url, ...init }) }),
     },
 
     /**

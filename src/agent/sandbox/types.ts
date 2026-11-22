@@ -55,13 +55,13 @@ export type { MemoryOps } from './types/memory'
 export type { ScheduleOps } from './types/schedule'
 export type { CompactOps } from './types/compact'
 
-/* ---------- chip / delivery / method / wf / code / userInfo ---------- */
+/* ---------- chip / delivery / method / wf / code / userInfo / team ---------- */
 export type { ChipOps } from './types/chip'
 export type { DeliveryOps } from './types/delivery'
 export type { MethodOps } from './types/method'
 export type { WorkflowOps } from './types/workflow'
-export type { CodeOps } from './types/code'
 export type { UserInfoOps } from './types/userInfo'
+export type { TeamOps } from './types/team'
 
 /* ---------- ui：界面操作 ---------- */
 export type { UiPointRequest, UiScrollRequest, UiCaptureResult, UiOps } from './types/ui'
@@ -101,8 +101,7 @@ export type {
   BrowserOps,
 } from './types/browser'
 
-/* ---------- mcp / res / video / project ---------- */
+/* ---------- mcp / video / project ---------- */
 export type { McpOps } from './types/mcp'
-export type { ResourceOps } from './types/resources'
 export type { VideoEpisodeInfo, VideoInfoResult, VideoOps } from './types/video'
 export type { ProjectTreeEntry, ProjectOps } from './types/project'

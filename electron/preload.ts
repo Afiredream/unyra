@@ -23,11 +23,11 @@ import type {
   AttachReadResult, BaseFileEditOpts, BaseFileEditResult, BaseFileEntry, BaseFileListResult, BaseFileOpResult, BaseFileReadResult,
   BaseFileStatResult, BaseFileWriteResult, BaseProcessCreateOpts, BaseProcessCreateResult, BaseProcessDeleteResult, BaseProcessGetResult,
   BaseProcessInfo, BaseProcessListResult, BaseProcessOutputResult, BaseProcessRunOpts, BaseProcessRunResult, BaseProcessStartResult, BaseProcessStatusResult,
-  BaseProcessStopResult, BaseProcessWaitOpts, BaseProcessWaitResult, CloseAction, CloseBehavior, CodeArtifact, ExamCloseReason,
+  BaseProcessStopResult, BaseProcessWaitOpts, BaseProcessWaitResult, CloseAction, CloseBehavior, ExamCloseReason,
   CropBoxInput, CropImageResult, PreviewCropResult, RotateImageResult,
-  ExamOpenResult, ExportPdfPayload, ExportPdfResult, FlushItem, McpStdioCallResult, McpStdioServerPayload, McpStdioToolsResult,
+  ExamOpenResult, ExportPdfPayload, ExportPdfResult, FlushItem, McpServeCall, McpServeReply, McpServeStatus, McpStdioCallResult, McpStdioServerPayload, McpStdioToolsResult,
   PluginEntry, PluginListResult, PluginSettingsResult,
-  PluginSourceResult, PluginTogglesResult, SaveBinaryPayload, SaveBinaryResult, SaveFilter, SilentMark, StorageEntry, StorageFail,
+  PluginSourceResult, PluginTogglesResult, SaveBinaryPayload, SaveBinaryResult, SaveFilter, StorageEntry, StorageFail,
   NoticeSettings,
   StorageInfo, StorageOk, StorageRootResult, UpdateChannel, UpdateFail, UpdatePhase, UpdateState,
   VideoApiFetchResult, VideoStreamOpenResult, WebDomOpResult, WebFastTranslateResult,
@@ -51,10 +51,10 @@ export type {
   AttachReadResult, BaseFileEditResult, BaseFileEntry, BaseFileListResult, BaseFileOpResult, BaseFileReadResult,
   BaseFileStatResult, BaseFileWriteResult, BaseProcessCreateOpts, BaseProcessCreateResult, BaseProcessDeleteResult, BaseProcessGetResult,
   BaseProcessInfo, BaseProcessListResult, BaseProcessOutputResult, BaseProcessRunOpts, BaseProcessRunResult, BaseProcessStartResult, BaseProcessStatusResult,
-  BaseProcessStopResult, BaseProcessWaitOpts, BaseProcessWaitResult, CloseAction, CloseBehavior, CodeArtifact, ExamCloseReason,
-  ExamOpenResult, ExportPdfPayload, ExportPdfResult, FlushItem, McpStdioCallResult, McpStdioServerPayload, McpStdioToolsResult,
+  BaseProcessStopResult, BaseProcessWaitOpts, BaseProcessWaitResult, CloseAction, CloseBehavior, ExamCloseReason,
+  ExamOpenResult, ExportPdfPayload, ExportPdfResult, FlushItem, McpServeCall, McpServeReply, McpServeStatus, McpStdioCallResult, McpStdioServerPayload, McpStdioToolsResult,
   PluginEntry, PluginListResult,
-  PluginSourceResult, PluginTogglesResult, SaveFilter, SilentMark, StorageEntry, StorageFail,
+  PluginSourceResult, PluginTogglesResult, SaveFilter, StorageEntry, StorageFail,
   NoticeSettings,
   StorageInfo, StorageOk, StorageRootResult, UpdateChannel, UpdateFail, UpdatePhase, UpdateState,
   WebDomOpResult,
@@ -73,15 +73,6 @@ export interface SaveTextResult {
   path?: string
   error?: string
 }
-
-export type ArtifactListResult =
-  | { ok: true; items: Record<string, CodeArtifact>; silent: Record<string, SilentMark> }
-  | { ok: false; error: string }
-
-/** 主进程替沙箱发出去的一次请求（真的结果，见 electron/runner.ts 的 runFetch） */
-export type RunnerFetchResult =
-  | { ok: true; status: number; statusText: string; headers: Array<[string, string]>; body: string; truncated: boolean }
-  | { ok: false; error: string }
 
 /** 外部文件（拖进来浏览的本地文件）的读写结果 */
 export type LocalReadResult = { ok: true; content: string } | { ok: false; error: string }
@@ -247,6 +238,25 @@ const api = {
   },
 
   /**
+   * 对外 MCP 服务（应用本身当 MCP server）：主进程把外部 harness 经命名管道
+   * 送来的工具调用转发到这里执行（guest 会话见 src/agent/mcp/serveHost），
+   * 回执经 reply 原路送回。与上面 mcp 那组方向相反：那条是**消费**外部服务，
+   * 这条是**对外提供**。
+   */
+  mcpServe: {
+    onCall: (cb: (call: McpServeCall) => void): (() => void) => {
+      const listener = (_e: unknown, call: McpServeCall) => cb(call)
+      ipcRenderer.on('mcpServe:call', listener)
+      return () => ipcRenderer.removeListener('mcpServe:call', listener)
+    },
+    reply: (reply: McpServeReply): void => ipcRenderer.send('mcpServe:reply', reply),
+    /** 主进程侧的服务状态（监听/管道/端点文件/连接数/桥路径）；服务停着也回答 */
+    status: (): Promise<McpServeStatus> => ipcRenderer.invoke('mcpServe:status'),
+    /** 开关：设置是渲染层的事实源，这里只推给主进程启停管道；回推最新 status */
+    setEnabled: (on: boolean): Promise<McpServeStatus> => ipcRenderer.invoke('mcpServe:setEnabled', on),
+  },
+
+  /**
    * 数据落盘。渲染层传的一律是相对根目录的相对路径，越界由主进程挡掉
    * （见 electron/storage.ts）。YAML 的解析/序列化留在主进程，
    * 渲染层拿到的就是普通对象，格式细节只有一处。
@@ -354,34 +364,6 @@ const api = {
       ipcRenderer.invoke('plugins:setToggle', id, enabled),
   },
 
-  /**
-   * 代码块伪编译的产物与联网出口（见 electron/runner.ts）。
-   *
-   * 两件事都只能在这儿做：产物要落在**数据目录**里（活过重启），
-   * 联网要被 CSP 挡在门外（渲染层的 Worker 连不上外网，只能请主进程代发）。
-   */
-  runner: {
-    /** 全量产物表（渲染层启动时拉一次，之后本地维护） */
-    artifacts: (): Promise<ArtifactListResult> => ipcRenderer.invoke('runner:artifacts'),
-
-    /** 存一份产物（按「代码 + 语言」的指纹） */
-    putArtifact: (key: string, value: CodeArtifact): Promise<StorageOk | StorageFail> =>
-      ipcRenderer.invoke('runner:putArtifact', key, value),
-
-    /** 记下「这段代码没有输出」：导师判定的结论，落盘之后那块不再可编译、不可运行 */
-    putSilent: (key: string, value: SilentMark): Promise<StorageOk | StorageFail> =>
-      ipcRenderer.invoke('runner:putSilent', key, value),
-
-    /** 清空全部产物（设置页里的清理入口） */
-    clearArtifacts: (): Promise<StorageOk | StorageFail> => ipcRenderer.invoke('runner:clearArtifacts'),
-
-    /** 替沙箱发一次请求。**用户同不同意是渲染层弹窗的事**，这里只负责发 */
-    fetch: (url: string, init: {
-      method?: string
-      headers?: Record<string, string>
-      body?: string
-    }): Promise<RunnerFetchResult> => ipcRenderer.invoke('runner:fetch', url, init),
-  },
 
   /**
    * 模型能力（设置 → 模型 → 能力接入）：TTS / STT / OCR 三个能力的合成与识别、

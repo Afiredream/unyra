@@ -23,7 +23,6 @@ export type {
   AskOption,
   AskQuestion,
   AskQuestionType,
-  CodeOps,
   CompactOps,
   CreateExamPayload,
   ExamAction,
@@ -31,7 +30,6 @@ export type {
   ExecuteTool,
   MemoryOps,
   MethodOps,
-  ResourceOps,
   ScheduleOps,
   SandboxCall,
   SandboxDocKind,
@@ -47,6 +45,7 @@ export type {
   WebOps,
   WorkflowOps,
   WorkspaceOps,
+  TeamOps,
 } from './sandbox/types'
 export { EXAM_ACTIONS } from './sandbox/types'
 

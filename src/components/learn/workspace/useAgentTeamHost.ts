@@ -15,6 +15,7 @@ import { upsertAgentTab, withAgentTabs } from '../../../learn/agentTabs'
 import { findTab, focusedTab } from '../../../learn/groups'
 import type { useAgent } from '../../../learn/useAgent'
 import { focusAgentInput } from '../../../lib/agentFocus'
+import { installMcpServeHost } from '../../../agent/mcp/serveHost'
 
 type AgentApi = ReturnType<typeof useAgent>
 
@@ -111,6 +112,10 @@ export function useAgentTeamHost({
     [],
   )
 
+  // 对外 MCP 服务（应用当 server）的 guest 会话：外部 harness 经命名管道调用工具，
+  // 在这里拿到与真沙箱同源的基座执行（见 src/agent/mcp/serveHost；单例，重挂自动换新）
+  useEffect(() => installMcpServeHost({ getLatest, set }), [getLatest, set])
+
   const scheduleFocusInput = useCallback(() => {
     if (focusTimerRef.current !== null) window.clearTimeout(focusTimerRef.current)
     focusTimerRef.current = window.setTimeout(() => {
@@ -188,9 +193,12 @@ export function useAgentTeamHost({
     }
     prevRunningRef.current = currentRunning
 
-    if (started.length === 0) return
+    // **委托会话（dv: 前缀）的轮不自动跳转**：承接方被委托启动是后台行为，用户留在
+    // 当前位置，从委托者会话底部的「委托中」条进入。工作流 / 用户直接对话的启动照旧跳。
+    const startedMain = started.filter((cid) => !cid.startsWith('dv:'))
+    if (startedMain.length === 0) return
 
-    const convId = started[started.length - 1]
+    const convId = startedMain[startedMain.length - 1]
     const s = getLatest()
     if (!conversationById(s, convId) && freeConversationById(convId)) {
       onSyncFreeConvId?.(convId)
