@@ -49,7 +49,7 @@ import {
   activateIn,
   activeIdsOf,
   allTabs,
-  claimTab, closeIds, DEFAULT_FIX_SIDE_WIDTH, ensureGoalAgentTeamTab,
+  claimTab, closeIds, ensureGoalAgentTeamTab,
   findTab,
   focusedTab,
   goalTabsOf,
@@ -142,7 +142,6 @@ import { DocPane } from './workspace/DocPane'
 import { ToolsDock } from './workspace/docks'
 import ScreenshotModal from '../tools/ScreenshotModal'
 import { Topbar } from './workspace/chrome'
-import { CreateGoalDialog } from './workspace/CreateGoalDialog'
 import { useZenMode } from './workspace/useZenMode'
 import { useAgentTeamHost } from './workspace/useAgentTeamHost'
 import { useDocSaveFlow } from './workspace/useDocSaveFlow'
@@ -176,6 +175,8 @@ import { useTabOpening } from './workspace/useTabOpening'
 import { useChipOpening } from './workspace/useChipOpening'
 import { useMouseNavTabs } from './workspace/useMouseNavTabs'
 import { useWorkspaceShortcuts } from './workspace/useWorkspaceShortcuts'
+import { toggleFixSideCollapse } from './workspace/agentSlotTabs'
+import { nextDefaultGoalTitle } from './workspace/goalNaming'
 import { t } from '../../i18n'
 
 export default function LearnWorkspace({
@@ -255,7 +256,6 @@ export default function LearnWorkspace({
    * 在独立窗口里改了之后宿主这边的快照要能跟着变——订阅是唯一能拿到那次通知的口子。
    */
   const agentSettings = useSyncExternalStore(subscribeAgentSettings, loadAgentSettings)
-  const [createGoalOpen, setCreateGoalOpen] = useState(false)
   const [sidebarOpen, setSidebarOpen] = useState(false)
 
   /*
@@ -404,9 +404,9 @@ export default function LearnWorkspace({
     const hit = goalAgentTabs.find((t) => agentTabKey(t) === store.agentActiveTab)
     if (hit) return hit
     /*
-     * 记着的激活项不在这个目标名下（切了目标、或它是别家目标的子代理）：
-     * 落到本目标这一枚——导师是跟着目标走的，切了目标却还对着上一个目标的导师说话最危险。
-     * 本目标一枚都没有时也必须回到固定聊天：固定聊天是 Agent 栏的底座，不能因为目标导师
+     * 记着的激活项不在这个目标名下（切了目标、或它是别家目标下的 work）：
+     * 落到本目标这一枚——role 是跟着目标走的，切了目标却还对着上一个目标的 role 说话最危险。
+     * 本目标一枚都没有时也必须回到固定聊天：固定聊天是 Agent 栏的底座，不能因为目标 role
      * 被关闭或旧的 activeAgentTab 失效而让整块 Agent 区消失。
      */
     return goalAgentTabs.find((t) => t.kind === 'goal') ?? freeTabRef
@@ -414,28 +414,28 @@ export default function LearnWorkspace({
   const activeAgentTabId = activeAgentTab ? agentTabKey(activeAgentTab) : null
   /**
    * 激活页签解析出的面板视图：目标级页签 → 那个目标当前展示的会话 + 落点节点；
-   * 子代理页签 → 它的父会话（subagent 的数据都住在导师对话上）与它自己的会话 id。
+   * work 页签 → 它所属的 role 会话与 work id（work 的消息与角色对话同一套渲染）。
    */
   const agentView = useMemo(() => {
     if (!activeAgentTab) return null
     if (activeAgentTab.kind === 'free') {
-      // 固定聊天没有目标/节点/子代理：这里只给出会话 id（agentTabProps 的 free 分支自己解析）
+      // 固定聊天没有目标/节点/work：这里只给出会话 id（agentTabProps 的 free 分支自己解析）
       return {
         tab: activeAgentTab,
         goalId: null as string | null,
         nodeId: null as string | null,
         conversationId: activeAgentTab.conversationId,
-        sessionId: null as string | null,
+        workId: null as string | null,
       }
     }
-    if (activeAgentTab.kind === 'sub') {
+    if (activeAgentTab.kind === 'work') {
       const conv = conversationById(store, activeAgentTab.conversationId)
       return {
         tab: activeAgentTab,
         goalId: conv?.goalId ?? null,
         nodeId: conv ? (goalFocusByGoal.get(conv.goalId) ?? null) : null,
         conversationId: activeAgentTab.conversationId,
-        sessionId: activeAgentTab.sessionId as string | null,
+        workId: activeAgentTab.workId as string | null,
       }
     }
     const goal = store.goals.find((g) => g.id === activeAgentTab.goalId) ?? null
@@ -455,7 +455,7 @@ export default function LearnWorkspace({
       goalId: activeAgentTab.goalId,
       nodeId: focusId || null,
       conversationId: convId,
-      sessionId: null as string | null,
+      workId: null as string | null,
     }
     // goalFocusByGoal 是模块级槽：读它不参与依赖（它的更新总伴随 store 变化，渲染会跟上）
   }, [activeAgentTab, store])
@@ -666,7 +666,7 @@ export default function LearnWorkspace({
   useEffect(() => {
     setZenActive(pure)
     if (pure) {
-      let initW = 860
+      let initW = 1000
       try {
         const saved = localStorage.getItem('moji:zen-width')
         if (saved) {
@@ -750,10 +750,8 @@ export default function LearnWorkspace({
    */
   const openSettingsRef = useRef<() => void>(() => {})
   const onOpenSettings = useCallback(() => openSettingsRef.current(), [])
-  /** 兼容外部调用（makeExamDeps / useConceptActions / useWorkflowStarters）：打开「新建目标」弹窗 */
-  const setCreating = useCallback((v: boolean) => {
-    setCreateGoalOpen(v)
-  }, [])
+  /** 兼容外部调用（makeExamDeps / useConceptActions / useWorkflowStarters）：旧「新建目标」弹窗已移除 */
+  const setCreating = useCallback((_v: boolean) => {}, [])
   /** browser.* 的宿主依赖槽：真正的值在 web 块里（openWebTab / webMeta 声明靠后），effect 里回填 */
   const browserDepsRef = useRef<BrowserDeps | null>(null)
 
@@ -807,7 +805,6 @@ export default function LearnWorkspace({
     openAgentTab,
     activateAgentTab,
     selectTutorGoal,
-    exitSubagentView,
     handleNewGoalConversation,
     newConversationIn,
     selectConversationIn,
@@ -1136,12 +1133,6 @@ export default function LearnWorkspace({
     pickLocal,
   } = useLibraryActions({ getLatest, set, flush, onToast, openTab, pushUndo })
 
-  /** 打开「新建目标」弹窗 */
-  const startCreatingGoal = () => {
-    setCreateGoalOpen(true)
-    setSidebarOpen(false)
-  }
-
   /* ---------- .unr 目标分享包（导出 / 导入 / 全屏拖拽遮罩）：见 workspace/useUnrTransfer ---------- */
   const { handleExportGoal, handleImportGoal, isDraggingFile } = useUnrTransfer({ getLatest, set, flush, openTab, onToast })
 
@@ -1182,10 +1173,9 @@ export default function LearnWorkspace({
   /* ---------- 新建学习目标 ---------- */
 
   const createGoal = useCallback(
-    (name: string) => {
-      const trimmed = name.trim()
-      if (!trimmed) return
-
+    (name?: string) => {
+      const curStore = getLatest()
+      const trimmed = name?.trim() || nextDefaultGoalTitle(curStore.goals)
       const goalId = crypto.randomUUID()
       const now = Date.now()
 
@@ -1204,8 +1194,6 @@ export default function LearnWorkspace({
         messages: [],
         updatedAt: now,
       }
-
-      const curStore = getLatest()
 
       // 打开 Agent 导师页签置前
       const tab0 = upsertAgentTab(
@@ -1228,7 +1216,7 @@ export default function LearnWorkspace({
       )
 
       const docAreaActivated = activateIn(docAreaWithAnchor, docAreaWithAnchor.focus, rootId)
-      const docArea = ensureGoalAgentTeamTab(docAreaActivated, goalId, now, { targetGroupId: docAreaActivated.focus })
+      const docArea = ensureGoalAgentTeamTab(docAreaActivated, goalId, now, { targetGroupId: docAreaActivated.focus, activate: true })
       const claimedOwners = claimTab(docArea.tabOwners, goalId, rootId)
 
       const nextStore: LearnStore = {
@@ -1240,7 +1228,6 @@ export default function LearnWorkspace({
         activeNodeId: null,
         activeConversationId: conversation.id,
         docArea: withOwners(docArea, claimedOwners),
-        ...(!curStore.fixSide ? { fixSide: { targetTabId: `team:${goalId}`, width: DEFAULT_FIX_SIDE_WIDTH } } : {}),
       }
 
       set(nextStore)
@@ -1249,6 +1236,12 @@ export default function LearnWorkspace({
     },
     [getLatest, set, onToast],
   )
+
+  /** 新建目标：不再弹标题输入框，直接创建默认名目标 */
+  const startCreatingGoal = () => {
+    createGoal()
+    setSidebarOpen(false)
+  }
 
   /*
    * 选区上的动作（学习 / 了解 / 注解 / 询问）整体在 useConceptActions（workspace/），
@@ -1304,8 +1297,8 @@ export default function LearnWorkspace({
 
   /*
    * 智能体团队（Tab 页版 AgentPanel）宿主协调：
-   * 监听工作区各处触发的工作流与提问表单（runningByConversation / pendingAskByConv），
-   * 自动同步 agentTabs 激活会话，并在需要时自动切至智能体团队页签。
+   * 只管理页签的打开 / 聚焦 / Ctrl+Q 往返；agent 被激活或工作流启动时**不自动跳页**，
+   * 用户停在哪里就是哪里。新 ask 表单仍会主动对齐并露出页签（见 useAgentTeamHost）。
    */
   const { toggleAgentTeam, expandAgentTeam } = useAgentTeamHost({
     getLatest,
@@ -1412,7 +1405,7 @@ export default function LearnWorkspace({
     openNewGoalInPlace,
     openNewFileInPlace,
     pickLocalInPlace,
-  } = useChipOpening({ getLatest, set, onToast, openTab, activateTab, openWebTab, selectNode: switchNode, exam, retargetNode, setOutlineFocus, setCreateGoalOpen, webMetaRef, examTabTitle })
+  } = useChipOpening({ getLatest, set, onToast, openTab, activateTab, openWebTab, selectNode: switchNode, exam, retargetNode, setOutlineFocus, onNewGoal: startCreatingGoal, webMetaRef, examTabTitle })
   /* ---------- 宿主接线（chip/插件/赞助/视频块/引用块/plot/静态资源/网页链接/effort 提醒）：见 workspace/useHostWiring ---------- */
   useHostWiring({
     onToast,
@@ -1499,6 +1492,7 @@ export default function LearnWorkspace({
     setPendingDelete,
     setPendingExamDelete,
     setExamDeleteStage,
+    pushUndo,
   })
 
   const handleOutlineFocusHandled = useCallback(() => {
@@ -1558,7 +1552,9 @@ export default function LearnWorkspace({
     getLatest,
     closeTab,
     pure,
-    toggleAgentTeam,
+    toggleFixSide: () => {
+      toggleFixSideCollapse(getLatest, set)
+    },
     toggleZen,
     isWeb,
     focusWebAddress,
@@ -1628,7 +1624,6 @@ export default function LearnWorkspace({
     activateAgentTab,
     openAgentTab,
     selectTutorGoal,
-    exitSubagentView,
     handleNewGoalConversation,
     removeConversation,
     newConversationIn,
@@ -1796,7 +1791,7 @@ export default function LearnWorkspace({
         activeGoalId={tabGoalId}
         onNewGoal={startCreatingGoal}
         onImportGoal={() => void handleImportGoal()}
-        onDeleteNode={requestRemoveNode}
+        onDeleteNode={requestRemoveNode} onDeleteGoal={requestRemoveNode}
         onRevealNode={(nodeId) => void revealNodeFile(nodeId)}
         onRevealWs={(rel) => void revealWsFile(rel)}
         onOpenWs={openWsFile}
@@ -1964,7 +1959,6 @@ export default function LearnWorkspace({
         pendingSuperDelete={pendingSuperDelete}
         commitRemoveSuperDoc={commitRemoveSuperDoc}
         onCancelSuper={() => setPendingSuperDelete(null)}
-        getLatest={getLatest}
       />
 
       {/*
@@ -2005,13 +1999,6 @@ export default function LearnWorkspace({
           onCancel={() => setPendingConflict(null)}
         />
       )}
-
-      {/* 新建目标弹窗 */}
-      <CreateGoalDialog
-        open={createGoalOpen}
-        onClose={() => setCreateGoalOpen(false)}
-        onCreate={createGoal}
-      />
 
       {/* 节点宇宙浮层：Tab 弹出/收回（见上面的 toggleStructOverlay）；画布与大纲页签同一套通道 */}
       {structOverlayGoal && (

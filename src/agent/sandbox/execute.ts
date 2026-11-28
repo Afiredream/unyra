@@ -5,6 +5,7 @@
 import { domOp } from '../../lib/docDom'
 import { MAX_TOOL_IMAGES, type AgentContext, type AgentTool, type AgentToolResult, type MessageImage } from '../types'
 import { buildApi, clip, imagesOf } from './api'
+import { apiResultOf } from './wrap'
 import { renderApiHelp, renderGroupHelp, renderRootHelp } from './apiRegistry'
 import { safeJson } from './askForm'
 import { compileBody } from './body'
@@ -140,16 +141,22 @@ export function createExecuteTool(opts: SandboxOptions): ExecuteTool {
          * api 组白名单（子代理专用）的硬闸：名单外的组当场拒绝。
          * apiAllow 是「execute 按需开放」的承诺，这里才是让它算数的地方——
          * 名单内的组照常，名单外的一律「没有这个 api」，并把开放的组写进报错，
-         * 模型据此改写调用而不是瞎试。log 是沙箱自己的通道，不受白名单管。
+         * 模型据此改写调用而不是瞎试。log 是沙箱自己的通道，不受白名单管；
+         * help 恒在场（见 apiRegistry 的 ALWAYS_CORE），不列进任何 apiAllow。
          */
-        if (opts.apiAllow?.length && name !== 'log' && !opts.apiAllow.includes(name.split('.')[0])) {
+        if (
+          opts.apiAllow?.length &&
+          name !== 'log' &&
+          name !== 'help' &&
+          !opts.apiAllow.includes(name.split('.')[0])
+        ) {
           throw new Error(
             '沙箱里没有这个 api：' + name + '。本次会话只开放了这些 api 组：' + opts.apiAllow.join('、'),
           )
         }
         if (name === 'log') {
           logLine(...callArgs)
-          return null
+          return { ok: true, api: 'log', lines: callArgs.length }
         }
         if (name === 'ui.dom.session') {
           const root = opts.ui?.domRoot?.() ?? null
@@ -164,7 +171,7 @@ export function createExecuteTool(opts: SandboxOptions): ExecuteTool {
           const [sid, op, opArgs] = callArgs as [string, string, unknown[]]
           const root = typeof sid === 'string' ? domSessions.get(sid) : undefined
           if (!root) throw new Error('ui.dom 会话已失效（文档被切换或关闭了），请重新调 api.ui.dom')
-          return domOp(root, String(op ?? ''), Array.isArray(opArgs) ? opArgs : [])
+          return apiResultOf(name, domOp(root, String(op ?? ''), Array.isArray(opArgs) ? opArgs : []))
         }
         /**
          * ui.dom 的**进程内直调**通道：真沙箱里回调在 Worker 侧，走上面的
@@ -180,7 +187,7 @@ export function createExecuteTool(opts: SandboxOptions): ExecuteTool {
           if (!root) {
             throw new Error('文档区现在没有可访问的 DOM：请先打开一份文档（api.ui.point 可以打开一个页签）')
           }
-          return await fn(makeDomFacade(root))
+          return apiResultOf(name, await fn(makeDomFacade(root)))
         }
         const segs = name.split('.')
         let targetObj: unknown = api
@@ -204,6 +211,7 @@ export function createExecuteTool(opts: SandboxOptions): ExecuteTool {
         } catch (err) {
           return { ok: false, error: err instanceof Error ? err.message : String(err) }
         }
+        value = apiResultOf(name, value)
         const images = imagesOf(value)
         if (!images.length) return value
         for (const img of images) {
@@ -241,7 +249,7 @@ export function createExecuteTool(opts: SandboxOptions): ExecuteTool {
         : syntaxAdvice
       const head = failureHeader(log)
       const tail = [whatHappened(log), logs.length ? '日志：\n' + logs.join('\n') : ''].filter(Boolean).join('\n')
-      const rexecuteTip = '\n💡【高效修复提示】：可直接调用 rexecute(pattern, replacement) 进行局部正则替换并重跑本次代码，无需重新发送完整长代码。'
+      const rexecuteTip = '\n💡【高效修复提示】：可直接调用 rexecute(pattern, replacement) 进行局部正则替换并重跑本次代码，无需重新发送完整长代码。**重跑前先看回执里哪些调用已经 ok:true / 已经落库**：已生效的业务必须先摘掉，否则重跑会重复写文件、重复发消息。'
       const res: AgentToolResult = {
         ok: false,
         content: clip(head + '执行失败' + detail + '：' + reply.error + advice + rexecuteTip + (tail ? '\n\n' + tail : '')),

@@ -19,7 +19,6 @@ import type { AgentRunTarget } from '../agent/sandboxOps'
 import { applyEvent } from '../agent/events'
 import { toChatHistory } from '../agent/history'
 import { loadImagesById, loadImagesFor } from '../images'
-import { loadAttachTexts } from '../agent/transfer'
 import type { StreamingSlot } from './slots'
 
 /** 这一轮的 token 账（导师轮与自由聊天共用同一份 shape）：各跳 usage 的累计与最后一跳的即时速度 */
@@ -58,9 +57,9 @@ export async function runTurnLoop(io: {
   setLiveUsage: Dispatch<SetStateAction<Record<string, MessageUsage>>>
   scheduleFlush: (immediate: boolean) => void
   /**
-   * 跳边界注入（见 agent/runtime 的介入通道）：委托交付回传走这里——委托者正在运行
-   * 时，team.complete 的交付结果在它当前轮的单次 loop 结束后插入、接着继续运行
-   * （宿主在回调里同步落库镜像片段，见 learn/agentTeam/delegations 与 agent/history）。
+   * 跳边界注入（见 agent/runtime 的介入通道）：Work 通道回传走这里——role 正在运行
+   * 时，work 的 host.send 交付／Agent 通道来信在它当前轮的单次 loop 结束后插入、接着
+   * 继续运行（宿主在回调里同步落库镜像片段，见 learn/roleWork/dispatch 与 agent/history）。
    */
   injections: () => Promise<AgentInjection | null>
 }) {
@@ -79,13 +78,18 @@ export async function runTurnLoop(io: {
     system: teacherSystem,
     /**
      * 历史里的图片要先读回内存：落盘的只有一条引用（见 agent/types 的 MessageImage），
-     * 字节在 {目标}/images 下。整段历史都读，而不是只读这一轮新增的那张——
-     * 模型要能看见前几轮聊过的那张图。
+     * 字节在 {目标}/images 下。调用方可能已经滤掉某些消息的 images（role 请求不挂用户附件），
+     * 这里按滤过的列表读，滤掉的那部分不会被重新读回来。
      */
-    messages: toChatHistory(history.messages, await loadImagesFor(history.messages), {
-      files: await loadAttachTexts(history.messages),
-      summary: history.summary,
-    }),
+    messages: toChatHistory(
+      history.messages,
+      // role 请求不挂用户附件图片的字节：去掉 user 消息里的 images 再加载，
+      // 但工具回传的图（res.read 看过的那张）仍保留，否则 role 会失忆。
+      await loadImagesFor(
+        history.messages.map((m) => (m.role === 'user' && m.images?.length ? { ...m, images: [] } : m)),
+      ),
+      { summary: history.summary, omitUserAttachments: true },
+    ),
     // 工具附带的图片（res.read 看了张图）也要读成字节才能挂上：与用户消息里的图同一条路
     loadImages: loadImagesById,
     tools,
@@ -107,8 +111,8 @@ export async function runTurnLoop(io: {
       noteRequest(target.conversationId, snapshot)
     },
     /**
-     * 动态提示词注入已退役（2026-11 全量静态提示词），通道现在只承载**委托交付回传**
-     * （team.complete → 委托者运行中 → 跳边界注入，见 learn/agentTeam/delegations）；
+     * 动态提示词注入已退役（2026-11 全量静态提示词），通道现在只承载**Work 交付 /
+     * Agent 来信**（host.send / chat.send → role 运行中 → 跳边界注入，见 learn/roleWork/dispatch）；
      * 宿主的回调负责镜像落库。回复里的 prompt-module 片段形态与 toChatHistory 的补发
      * 逻辑保留——老对话的历史里还有这种片段，还原口径不变（见 agent/history）。
      */

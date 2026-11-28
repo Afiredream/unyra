@@ -255,8 +255,10 @@ export async function apiNameTests() {
     'classroom.animations': '',
     'classroom.sounds': '',
     'classroom.check': "{ target: 'classroom_probe' }",
-    'classroom.registerComponent': "{ tag: 'ui-probe-card', name: '探针卡', description: '探针用组件', template: '<div>{{content}}</div>' }",
+    'classroom.registerComponent': "{ tag: 'ui-probe-card', name: '探针卡', description: '探针用组件', source: \"export default { kind: 'classroom-component', tag: 'ui-probe-card', component: () => <div>probe</div> }\" }",
     'classroom.registerAnimation': "{ verb: 'probeSpin', name: '探针动效', keyframes: { opacity: [0, 1] } }",
+    'classroom.registerSound': "{ name: 'probe-chime', label: '探针音效', description: '探针用音效' }",
+    'classroom.unregister': "{ kind: 'sound', id: 'probe-chime' }",
     // 内置浏览器：webview 元素在真实渲染层，探针给一份假的宿主（见下面 browser 桩）
     'browser.open': "'https://example.com'",
     'browser.tabs': '',
@@ -383,6 +385,24 @@ export async function apiNameTests() {
     'schedule.update': "'probe-schedule', { time: '22:00' }",
     'schedule.complete': "'probe-schedule'",
     'schedule.remove': "'probe-schedule'",
+    // 文档设计域：组件清单 / 查询 / 注册 / 更新 / 删除（注册与更新用不存在的目标，
+    // 只证明 api 真的注册了，不在探针里留外部组件状态）
+    'design.component.list': '',
+    'design.component.get': "'Notice'",
+    'design.component.register': "{ name: '探针组件', description: '探针' }",
+    'design.component.update': "{ id: 'probe-component', description: '探针' }",
+    'design.component.delete': "'probe-component'",
+    // 智能体名录：role 共用的只读 list（内置 + 外部 agent 的 id / 名称 / 简介）
+    'agent.list': '',
+    // role-work：role 的 work.* / chat.*，work 的 host.*（宿主桩在 createAgentOps 里）
+    'work.list': '',
+    'work.status': "'调研-1'",
+    'work.stop': "'调研-1'",
+    'work.create': "{ name: '调研-1' }",
+    'work.kill': "'调研-1'",
+    'work.send': "{ name: '调研-1', text: '探针任务' }",
+    'chat.send': "{ channel: 'user', text: '探针：通道检查' }",
+    'host.send': "{ text: '探针交付' }",
     // 智能体团队编排（team.*）：派发器不在场时这些都要优雅应答（不能抛、不能说 api 不存在）
     'team.list': '',
     'team.status': "'tutor'",
@@ -454,6 +474,23 @@ export async function apiNameTests() {
     // team.* 的发起方身份（探针 = 导师声部的一段会话）：名单检查只问「这五个 api 在不在」，
     // 无派发器时 delegate / status 的优雅拒绝与空状态本身就是断言对象
     teamFrom: () => ({ conversationId: 'probe-conv', agent: 'tutor', goalId }),
+    // role-work 三组：工作层不在探针里真跑，只给最小宿主桩证明注册路径在
+    agent: {
+      list: () => [
+        { id: 'tutor', name: '导师龟', bio: '探针简介' },
+        { id: 'dispatcher', name: '经理龟', bio: '探针简介' },
+      ],
+    },
+    work: {
+      list: () => [],
+      status: () => ({ error: '探针里没有 work 会话' }),
+      stop: () => ({ ok: true }),
+      create: () => ({ ok: true, name: 'probe-work' }),
+      kill: () => ({ ok: true }),
+      send: () => ({ ok: true, name: 'probe-work' }),
+    },
+    chat: { send: (input) => ({ ok: true, channel: input.channel, id: 'probe-chat' }) },
+    host: { send: () => ({ ok: true, delivered: true }) },
     // 桩：这一组只查「名字真的注册了吗」，行为由 examTests 与用例各自覆盖
     exam: {
       create: () => ({ ok: true, content: '（桩）' }),
@@ -621,6 +658,8 @@ export async function apiNameTests() {
   ok(!denied.ok && denied.content.includes('只开放了'), 'apiAllow 名单外的组当场被拒', denied.content.slice(0, 160))
   const allowed = await sub.run({ description: '搜索', body: "((api)=>{ return await api.web.search('勾股定理') })" }, { nodeId: childId, goalId })
   ok(allowed.ok && (allowed.content.includes('baidu') || allowed.content.includes('百度百科') || allowed.content.includes('勾股定理')), 'apiAllow 名单内的组照常放行', { content: allowed.content.slice(0, 120) })
+  const help = await sub.run({ description: '根 help', body: '((api)=>{ return await api.help() })' }, { nodeId: childId, goalId })
+  ok(help.ok && help.content.includes('api.node'), 'api.help 恒在场，不受 apiAllow 限制', help.content.slice(0, 120))
 
   // 动态提示词注入的触发口已退役（2026-11 全量静态提示词）：execute 不再有 onPromptModule
   // 通道，规程随系统提示词首轮在场、登记工作流的 prompt 在轮首注入（见 useAgent/hook）。

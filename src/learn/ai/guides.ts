@@ -6,12 +6,10 @@
 /**
  * 正文排版指南：教学文档长什么样、Markdown 与 HTML 各占什么位置。
  */
-export const RICH_CONTENT_GUIDE = `正文排版规范（重要）：教学文档**以标准 Markdown 为主**——Markdown 能表达的一律用 Markdown（标题、列表、强调、表格、引用、代码块）；HTML + Tailwind 只作补充，用在 Markdown 做不到的地方：交互（按钮、折叠）与复杂结构（两栏对照、提示框、时间轴、图表容器）。
+export const RICH_CONTENT_GUIDE = `正文排版规范（重要）：教学文档**以标准 Markdown 为主**——Markdown 能表达的一律用 Markdown（标题、列表、强调、表格、引用、代码块）；HTML + Tailwind 只作补充，用在交互（按钮、折叠）与复杂结构（两栏对照、提示框、时间轴、图表容器）。
 - 用 HTML 时带上字号与墨色：正文段落如 \`<p class="text-[0.9em] leading-[1.85] text-ink">\`；小节标题使用带间距的语义标签。
-- **字号一律使用 em（相对正文）**，禁止写 px（正文支持等比缩放）；布局宽度上限 800px，可用内容宽度约 745px。
-- 颜色优先采用应用主题令牌（bg-paper / bg-card / bg-sunken / text-ink / text-ink-strong / text-seal 等），自动跟随深浅色主题。
 - **LaTeX 兼容性（重要注意事项）**：公式必须写成**最标准、最大程度兼容**的写法——行内 $…$、独立公式 $$…$$（不用 \\(…\\)、\\[…\\] 定界）；命令只用核心子集，不用 \\usepackage、\\newcommand、\\label/\\ref 这类宏包与交叉引用；**不要用 Unicode 字符近似数学**（直接写 \\alpha、x^2、\\sqrt{2}，不要写 α、x²、√2）；非必要不在公式里写中文，需要时放 \\text{…} 里——要保证公式在渲染器与主流 Markdown 编辑器里都能原样显示。
-- **在 execute 脚本里拼含 LaTeX 的正文必须用 \`String.raw\`**（机制与写法见 execute 纪律：普通模板字符串会先按 JS 转义表吃一遍反斜杠，公式还没写入就坏了）。写入回执若报「疑似公式损坏」，按提示改写后重发。
+- **脚本里拼含 LaTeX 的正文按执行纪律用 \`String.raw\`**；写入回执报「疑似公式损坏」时，按提示改写后重发。
 - 严禁在教学文档中编写待办/打勾清单（如 <input type="checkbox">），文档是读物而非表单。
 - 完整排版配方（两栏对照、提示框、时间轴、公式解剖卡等）见下方「文档排版与视觉呈现」规范。`
 
@@ -24,11 +22,12 @@ export const RICH_CONTENT_GUIDE = `正文排版规范（重要）：教学文档
  * 交付段只有持有 api.delivery 的声部（导师 / 出卷师 / 调研员）渲染——维修员两段都不给。
  * CHIP_DELIVERY_GUIDE 是导师 / 出卷师的合并版（标题 + 两段逐字拼回，与拆分前同文）。
  */
-export const CHIP_QUOTE_GUIDE = `- 回复中引用具体文件 / 交付物一律使用 chip 语法 \`#[{…}]\`（学习者端渲染为可点击卡片），**必须通过 api.chip.build 生成并原样填入回复（可 api.chip.check 校验草稿），严禁手动拼接**。chip 最大宽度有限，title 精简到 15~25 个汉字（如《MDN: Flex 布局指南》），详细说明写在 chip 后面的正文里。
+export const CHIP_QUOTE_GUIDE = `- 回复中引用具体文件 / 交付物一律使用 chip 语法 \`#[{…}]\`（学习者端渲染为可点击卡片），**必须通过 api.chip.build 生成并原样填入回复（可 api.chip.check 校验草稿），严禁手动拼接**。chip 最大宽度有限，title 精简到 15~25 个汉字（如《MDN: Flex 布局指南》），详细说明写在 chip 后面的 \`text\` 里。
 - **文档内参考引证（铁律）**：凡经联网查证写成的教学文档，文末必须包含「## 📚 参考资料与权威来源」区块，每条以**网页 chip**（#[{"type":"web","url":"...","title":"..."}]）开头，严禁普通 Markdown 超链接 [文字](url)。`
 
 /** 交付账登记（持有 api.delivery 的声部渲染；口径与拆分前逐字一致） */
-export const DELIVERY_LEDGER_GUIDE = `- **一轮的交付账不写进正文**：本轮新增 / 修改 / 删除的文件与真正引用到的来源，收尾用一次 \`api.delivery.submit({ files, sources })\` 登记——界面在消息底部按「一行一条」展示；没有交付物就不要调。\`files[].path\` 写**数据树里的节点路径原样**（如「微积分/极限」）或**带扩展名的工作区文件路径**；不要自己拼 \`/教学\` \`/讲义\` 这类后缀——界面按这两种形态分别打开文档与文件，拼错就点不开。`
+export const DELIVERY_LEDGER_GUIDE = `- **交付账必须含 \`files\` + \`sources\`**：新增 / 修改 / 删除的文件逐条进 \`files\`，交付内容里真正引用到的来源逐条进 \`sources\`（\`title\` + \`http(s)\` URL）——只登文件、不登来源视为未交付；没有交付物就不要调。界面在消息底部按「一行一条」展示，\`text\` 不必复述。\`files[].path\` 写**数据树里的节点路径原样**（如「微积分/极限」）或**带扩展名的工作区文件路径**；不要自己拼 \`/教学\` \`/讲义\` 这类后缀——界面按这两种形态分别打开文档与文件，拼错就点不开。
+- **账的粒度**：role 账按当前一轮；work 账按该 work 会话累计，分几次 \`api.delivery.submit\` 会合并去重，回执与后续转发拿到的都是**整份累计快照**，不是本次增量。`
 
 /** 导师 / 出卷师的合并段（同时持有 chip 与 delivery）：标题 + 两段，与拆分前逐字一致 */
 export const CHIP_DELIVERY_GUIDE = '引用与交付登记纪律：\n' + CHIP_QUOTE_GUIDE + '\n' + DELIVERY_LEDGER_GUIDE

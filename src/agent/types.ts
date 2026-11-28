@@ -6,9 +6,10 @@
  * - AgentEvent：运行时向前端推送的增量事件（思考 / 工具 / 正文）
  * - AgentTool：可注册的工具；新增能力只需实现一个工具并注册进 ToolRegistry
  */
-import type { ChatUsage } from '../ai/types'
-import type { AgentVoice } from './agentProfile'
+import type { ChatUsage, ServerToolCall, ServerToolStep } from '../ai/types'
+import type { AgentProfileId, AgentVoice } from './agentProfile'
 import type { DeliveryRecord } from './delivery'
+import type { AskAnswers, AskFormPayload } from './sandbox/types/ask'
 
 /** 会话里一条消息的组成片段：思考过程、正文回复、一次工具调用、一条运行时提示 */
 export type AgentPart =
@@ -37,16 +38,30 @@ export type AgentPart =
     }
   | {
       /**
-       * 委托交付的跳边界注入（team.complete，见 learn/agentTeam/delegations）：与
-       * prompt-module 同一条镜像纪律——runtime 在 hop 边界 push 一条 **user** 消息
-       * （pushInjection 对 user 角色恒不降级），宿主把交付全文记成本片段；toChatHistory
+       * 通道消息的跳边界注入（role-work 的 Work / Agent 通道，见 learn/roleWork）：
+       * 与 prompt-module 同一条镜像纪律——runtime 在 hop 边界 push 一条 **user** 消息
+       * （pushInjection 对 user 角色恒不降级），宿主把通道消息记成本片段；toChatHistory
        * 在它所在的位置补发一条 **恒为 user** 的消息（逐字节重放，见 agent/history）。
        * 界面渲染成与思考/工具同层的折叠块。
        */
-      type: 'team-delivery'
-      /** 交付所属的委托 id */
-      delegationId: string
+      type: 'channel-message'
+      /** 通道消息 id */
+      channelId: string
       text: string
+    }
+  | {
+      /**
+       * DeepSeek 服务端联网工具的一次调用（`deepseek_web_search` / `deepseek_read_url`）。
+       * 只在 work 层开启；界面在思维列表里展开成「搜了什么、看了哪些来源」。
+       */
+      type: 'web'
+      /** 服务端 call id */
+      id: string
+      /** 第几步；同一轮可能有多步 */
+      step: number
+      /** 本步的思考原文，回传历史时按步恢复 */
+      reasoning?: string
+      call: ServerToolCall
     }
   | {
       type: 'tool'
@@ -73,8 +88,116 @@ export type AgentPart =
     }
 
 /**
- * 一条回复的 token 账。
- *
+ * role-work 四通道的公共戳。宿主在消息入站时写入，模型只能读、不能改：
+ * - user：用户通道（界面输入 / 用户附件）；
+ * - agent：角色通道（另一位 role 私聊发来的话）；
+ * - work：工作通道（本 role 的 work 交付或状态）；
+ * - group：群聊通道（多角色共用一条会话，必须 @ 才能点名交付）。
+ */
+export type ChannelKind = 'user' | 'agent' | 'work' | 'group'
+
+ /** 通道里的一端：用户 / 角色 / 工作会话 / 群聊 */
+export interface ChannelPeer {
+  kind: 'user' | 'role' | 'work' | 'group'
+  id: string
+  name: string
+}
+
+/** 入站消息的来源与时间戳（模型历史里会渲染成一行元信息抬头） */
+export interface ChannelStamp {
+  channel: ChannelKind
+  from: ChannelPeer
+  to: ChannelPeer
+  ts: number
+  envelopeId: string
+  /** 所属学习目标；群聊按目标分开，私聊 / agent / work 可省略 */
+  goalId?: string
+  /** 群聊评论串索引（`通道id>消息id`）；一级主楼也可能带（表示它拥有/继承了一条评论串） */
+  threadId?: string
+  /** 该消息属于哪条一级主楼；只有评论区里的消息才填，一级主楼不填 */
+  threadRootId?: string
+  /** 本条群消息是否把当前 role 作为唯一 mention 激活；缺省 = 只是 @ 抄送，不一定是自己的任务 */
+  mention?: boolean
+  /** 这条入站消息自带的交付账；role mind 里的用户消息据此展示交付组件 */
+  delivery?: DeliveryRecord
+}
+
+/** 通道消息里的额外数据：正文之外的日志 / 原始结果 / 长文本，界面折叠展示，避免刷屏。 */
+export interface ChannelExtra {
+  /** 折叠条的标题，例如「调研原始结果」「工具输出」 */
+  title?: string
+  /** 放在正文之外的完整数据；支持 Markdown */
+  text: string
+  /** 展示格式；缺省 text */
+  format?: 'text' | 'markdown' | 'json'
+}
+
+/** ask 气泡的生命周期状态：pending 之外一律不可再提交。 */
+export type ChannelAskStatus = 'pending' | 'answered' | 'cancelled' | 'expired'
+
+/**
+ * 通道里的 ask 气泡。表单本身来自 agent/sandbox 的 AskFormPayload；
+ * expiresAt 是宿主写死的截止时间（毫秒时间戳），UI 据此画倒计时进度条。
+ */
+export interface ChannelAsk {
+  id: string
+  form: AskFormPayload
+  expiresAt: number
+  status: ChannelAskStatus
+  /** 用户提交 / 取消 / 超时的时间 */
+  settledAt?: number
+  /** 提交成功时的答案快照：表单不消失，只读回看就靠它 */
+  answers?: AskAnswers
+}
+
+/** 一条通道流水：role 的外部收发都在这里，聊天层只读它，不碰工具/思考。 */
+export interface ChannelMessage {
+  id: string
+  kind: ChannelKind
+  direction: 'in' | 'out'
+  from: ChannelPeer
+  to: ChannelPeer
+  /**
+   * 消息正文。单独一行 `---` 可分隔简短 / 详细：分隔线前是口语化短汇报，
+   * 后面是详细改动、索引名、标识符与专业说明；聊天层默认只显示短汇报。
+   */
+  text: string
+  ts: number
+  attachments?: { images?: MessageImage[]; files?: MessageFile[] }
+  /** 正文之外的额外数据（可折叠）；Agent 之间的大段结果优先放这里 */
+  extra?: ChannelExtra
+  /** 结构化问询气泡；有它时正文只是引子，界面画表单与倒计时 */
+  ask?: ChannelAsk
+  /** work.send / chat.send 引用转发的用户消息 id */
+  quoteMessageId?: string
+  /** 抄送对象：只同步上下文，不激活、不跑新一轮（一条消息可抄送多位） */
+  cc?: ChannelPeer[]
+  /**
+   * 本条消息唯一被激活的 mention。一条消息最多一个；只有它会在送达之外启动一轮。
+   * 用户消息的首个 @ 由宿主解析成 mention，agent 侧显式传 `mention`。
+   */
+  mention?: ChannelPeer
+  /** 本轮交付账（work 交付 / role 转发到通道时带上，界面在气泡下方展示） */
+  delivery?: DeliveryRecord
+  /** 所属学习目标（群聊按目标分开；其它通道可省略） */
+  goalId?: string
+  /**
+   * 群聊评论串索引，格式严格为 `通道id>消息id`（通道id = `group:<goalId>`，消息id = 一级主楼 id）。
+   * 一级主楼带它表示「这条消息拥有/继承了这条评论串」；评论区里的评论带它 + threadRootId。
+   */
+  threadId?: string
+  /**
+   * 该消息属于哪条一级主楼（只有评论区里的消息才填）。一级主楼不填，所以群聊一级列表
+   * 用 `!threadRootId` 过滤；ask 这类落在一级但继承任务线程的消息可以只带 threadId。
+   */
+  threadRootId?: string
+  /** 收口兜底自动补发（模型没显式 send） */
+  auto?: boolean
+  /** 静默汇报：只入目标 role 的上下文与通道流水，不启动它一轮（chat.send silent:true） */
+  silent?: boolean
+}
+
+/**
  * 一轮 Agent 可能来回好几跳（模型 → 工具 → 模型），每跳都是一次独立请求：
  * - contextTokens：**最后一跳**的输入量，也就是「此刻上下文占了多少」——
  *   圆环的百分比用的是它，因为下一跳要送进去的就是这么多；
@@ -182,8 +305,8 @@ export interface ConversationMessage {
    * - `'instruction'`：**工作流指令**。触发一条工作流时整段进入上下文的那条 user 消息
    *   （开讲 / 出卷 / 阅卷 / 压缩…）。它是一道**轮次边界**：界面上画一条分界条。
    * - `'prompt'`：**提示词注入**。人格 / 文档格式 / 技能库 / 提示词模块这些「补给上下文」
-   *   的隐藏消息。它们不分割轮次，界面上并进那一轮的「思考、工具与提示词」过程组——
-   *   与思考、工具调用是同一层的东西（都是「这一轮它凭什么这么答」）。
+   *   的隐藏消息。它们不分割轮次，界面上与思考、工具调用逐项平铺——
+   *   同一层的东西（都是「这一轮它凭什么这么答」）。
    *
    * 两者从前都塞进同一条分界条里，几条一起注入时那行字被挤得溢出（用户报的 bug）。
    * 这个字段就是那条分界线的判据：**只有 instruction 才画**。
@@ -234,6 +357,11 @@ export interface ConversationMessage {
    * 与 hidden 的区别：hidden 连正文都不显示，context 只补充说明、正文照常显示。
    */
   context?: string
+  /**
+   * 这条消息从哪个通道来（role-work 的三通道）：用户 / Agent / Work。
+   * 只入站消息带；宿主写入，模型不能伪造。toChatHistory 会在正文前补一行来源 + 时间戳。
+   */
+  channel?: ChannelStamp
   /** 「询问」引用的选段：气泡里显示为可点击引文，点击回到笔记高亮对应文字 */
   quote?: MessageQuote
   /** 这条消息带的图（只存引用，字节在磁盘上）；没有图就没有这个字段 */
@@ -391,11 +519,15 @@ export interface Conversation {
    */
   inflight?: { messageId: string; startedAt: number }
   /**
-   * 子代理（见 docs/subagent-architecture.md）：这段对话里登记过的自定义定义与活着的
-   * 会话（各自的独立上下文）。**生命周期 = 这段对话**：随 chat.json 落盘、随对话删除
-   * 一起消失。没有子代理的对话不写这个字段（空桶存 undefined）。
+   * role 的外部通道流水（user / agent / work）。聊天层只读这一份，
+   * 因此永远不会把工具与思考暴露给外部；思维层另有 messages。
    */
-  subagents?: SubAgentBucket
+  channels?: ChannelMessage[]
+  /**
+   * 本 role 掌握的工作会话（work）：上下文独立、随这段 role 对话落盘、随对话删除消失。
+   * 没有 work 的 role 不写这个字段（空桶存 undefined）。
+   */
+  works?: WorkBucket
   /**
    * **固化的系统提示词**：这段对话的第一次请求抓一份、之后每一轮都用它（不再现拼）。
    *
@@ -409,59 +541,47 @@ export interface Conversation {
 }
 
 /**
- * 子代理的类型契约（持久化在 Conversation.subagents 上，随 chat.json 落盘）。
- *
- * 子代理是导师派出去干活的「分身」：各有自己独立的上下文，在导师的对话里跑自己的
- * 「思考 → 工具 → 观察」循环，跑完只把**一份交付消息**交回导师（中间过程不进导师上下文）。
- * 没有内置的：导师用 api.subagent.create 先登记定义（系统提示词与可用的 api 组），
- * 再 api.subagent.run 派任务；登记只活在当前这段对话里，不能跨对话复用，
- * 本对话内可反复派活（会话按 key 复用）。
- * 架构与边界见 docs/subagent-architecture.md；实现见 agent/subagent/。
+ * 一个 work 会话（role-work 的工作层）。它不是对外的角色：没有名字、没有人格，
+ * 只接 role 的任务并把结果用 api.host.send 交回去。上下文独立，生命周期 = 所属 role 对话。
  */
+export type WorkStatus = 'idle' | 'running' | 'interrupted' | 'stopped' | 'error'
 
-/** 一个子代理的定义：key 是导师寻址它的唯一凭据 */
-export interface SubAgentDef {
-  /** 稳定标识：agent_run 的 agent 参数写的就是它 */
-  key: string
-  /** 显示名（面板的会话列表用） */
-  name: string
-  /** 子代理自己的系统提示词——它的上下文里唯一的一号消息 */
-  system: string
-  /**
-   * execute 开放的 api 组（SandboxOptions.apiAllow，如 ['web','tmp']）。
-   * 「子代理都有 execute 工具，api 按需开放」就是它：名单外的组在通道口被硬拒。
-   */
-  apiGroups: string[]
+/** work.status 的过程轨迹：只记 execute 的标题（description），不存 body / args */
+export interface WorkExecuteTrace {
+  at: number
+  title: string
 }
 
-export type SubAgentStatus = 'idle' | 'running' | 'interrupted' | 'error'
-
-/** 一次生命的实例：一个定义可以对应一个活着的会话（按 defKey 复用） */
-export interface SubAgentSession {
+export interface WorkSession {
   id: string
-  defKey: string
-  status: SubAgentStatus
-  /** 已完成的任务次数 */
+  /** role 内唯一、可命名的地址 */
+  name: string
+  roleId: AgentProfileId
+  /** 绑定到哪一段 role 会话（work 只对接这一个 role） */
+  roleConversationId: string
+  status: WorkStatus
+  /** 已完成的任务轮次 */
   runs: number
   createdAt: number
   lastActiveAt: number
-  /**
-   * 自己独立的上下文。就是普通的 ConversationMessage[]：导师的任务是一条 user 消息，
-   * 每次任务是一条 assistant 回复（parts 里含工具卡片、思考与通知）。
-   * 界面渲染与模型历史（toChatHistory）共用这一份——与导师同一套镜像纪律。
-   */
+  /** 本轮开始时刻（running 时有） */
+  runningSince?: number
+  /** 累计运行时长（毫秒；running 时由宿主把 runningSince 叠上） */
+  runtimeMs: number
+  /** 创建时固化的系统提示词（无任何人设） */
+  systemPrompt: string
+  /** 自己独立的上下文：role 下发的任务是一条 user 消息，每次任务是 assistant 回复 */
   messages: ConversationMessage[]
-  /** 最近一次交付的预览（会话列表用；完整交付只进导师上下文） */
   lastDelivery?: string
-  /** 最近一次没能交付的原因（中断 / 出错）——列表里要说清为什么没有交付 */
+  /** 最近一次 `api.delivery.submit` 的结构化交付账；role 转发时原样带走 */
+  delivery?: DeliveryRecord
   lastIssue?: string
+  execTrace: WorkExecuteTrace[]
 }
 
-/** 一段对话的子代理桶：自定义定义 + 会话。生命周期 = 这段导师对话（随 chat.json 落盘） */
-export interface SubAgentBucket {
-  /** 导师经 api.subagent.create 登记的定义（只在本对话内有效） */
-  defs: SubAgentDef[]
-  sessions: SubAgentSession[]
+/** 一段 role 对话的 work 桶 */
+export interface WorkBucket {
+  sessions: WorkSession[]
 }
 
 /** 运行时事件流：前端据此增量渲染 */
@@ -485,6 +605,14 @@ export type AgentEvent =
    * 这两种在 parts 里长得一模一样，只有 runtime 自己知道边界在哪。
    */
   | { type: 'hop' }
+  /**
+   * DeepSeek 服务端联网工具的实时进展：call_started 先落一条 running 的 web 片段，
+   * call_completed 再补来源；web-tools-final 是整轮结束后的完整清单（补 signature，
+   * 也兜住开始/结束事件丢失的情况）。
+   */
+  | { type: 'web-tool-start'; step: number; call: ServerToolCall }
+  | { type: 'web-tool-end'; step: number; call: ServerToolCall }
+  | { type: 'web-tools-final'; steps: ServerToolStep[] }
   /** 非错误的运行时提示：输出被截断、步数用尽、正在重试等 */
   | { type: 'notice'; level: 'warn' | 'info'; message: string }
   /**

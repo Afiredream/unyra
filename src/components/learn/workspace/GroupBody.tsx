@@ -12,8 +12,6 @@ import { isWeb } from '../../../lib/native'
 import { openExternalLink } from '../../../lib/externalLink'
 import { CHIP_MIME, parseChipJson } from '../../../lib/chipSyntax'
 import { parseSuperHref, handleSuperLink } from '../../../lib/nodeLink'
-import { globalSummary } from '../../../ai/settings'
-import { saveAgentSettings } from '../../../agent/settings'
 import { t } from '../../../i18n'
 import TabBar from '../TabBar'
 import WebTabLayer, { type WebTab } from '../web/WebTabLayer'
@@ -28,24 +26,25 @@ import { computeRelations } from '../docRelations/computeRelations'
 import PluginDoc from '../../plugins/PluginDoc'
 import SponsorsDoc from '../../sponsor/SponsorsDoc'
 import VimCheatSheetView from '../vim/VimCheatSheetView'
-import SettingsPanel from '../../settings/SettingsPanel'
+import { SettingsPage } from '../../settings/SettingsPage'
+import { PromptFileView } from '../agent-team/PromptFileView'
 import UserTabPane from '../../user/UserTabPane'
 import TerminalTabPane from '../../terminal/TerminalTabPane'
 import UsagePanel from '../../settings/UsagePanel'
 import ClassroomView from '../classroom/ClassroomView'
-import ClassroomShowcasePage from '../classroom/ClassroomShowcasePage'
 import AgentTeamPage from '../agent-team/AgentTeamPage'
 import { SchedulePage } from '../../schedule/SchedulePage'
 import MindPanel from '../../agent/MindPanel'
-import AgentSettingsPanel from '../../AgentSettingsPanel'
 import { EmptyDoc } from './chrome'
 import { DocPane } from './DocPane'
 import { OutlinePane } from './OutlinePane'
 import { FileTabLayer } from './FileTabLayer'
 import { EditorTabLayer } from './EditorTabLayer'
 import { SideSplitLayout } from './SideSplitLayout'
+import { FixSideWebNotice } from './FixSideWebNotice'
 import { paneInfo, examCopyOf, conceptKeysOf } from './panes'
 import { createVideoTabBridge } from './videoTabBridge'
+import { returnToAgentPage } from './agentSlotTabs'
 import { memoryDocKey } from '../../../lib/memoryMode'
 import { ZONE_BOX } from './drag'
 
@@ -67,7 +66,6 @@ export function renderGroupBody(ctx: GroupBodyCtx) {
     set,
     onToast,
     openTab,
-    onRootChanged,
     users,
     activeUserId,
     onSelectUser,
@@ -138,13 +136,6 @@ export function renderGroupBody(ctx: GroupBodyCtx) {
     memoryUpdate,
     memoryDelete,
     memoryClearWork,
-    agentSettings,
-    hasKey,
-    debugWin,
-    openContextTrace,
-    workflowRows,
-    runWorkflowRow,
-    removeWorkflowRow,
     requestGenerateDoc,
     getNoteActions,
     agent,
@@ -189,9 +180,8 @@ export function renderGroupBody(ctx: GroupBodyCtx) {
     gTab.ref.kind !== 'draft' &&
     // 视频学习页（实验）不画：大纲/视图切换对播放器没有意义（用户定的）
     gTab.ref.kind !== 'video' &&
-    // 互动课堂与组件动效库不画：沉浸式独立画布与舞台页面，自成体系不画文档侧栏
+    // 互动课堂不画：沉浸式独立画布与舞台页面，自成体系不画文档侧栏
     gTab.ref.kind !== 'classroom' &&
-    gTab.ref.kind !== 'classroomShowcase' &&
     gTab.ref.kind !== 'agentTeam' &&
     // 插件文档页不画：它是参考手册，不是可编辑节点文档
     gTab.ref.kind !== 'pluginDoc' &&
@@ -221,8 +211,18 @@ export function renderGroupBody(ctx: GroupBodyCtx) {
     tabOwners,
     activeGoalId,
   )
-  /** 这一格挂着的网页页签：WebTabLayer 常驻层只挂一份，切页签只藏不卸（见下） */
-  const gWebTabs = gVisibleTabs.filter((x): x is WebTab => x.ref.kind === 'web')
+  /** Vim :side 页签内传送目标（若当前页签未启用或目标已关闭则为 null） */
+  const gSideTarget = findSideTargetTab(docs, gTab)
+  /** 固定外侧栏的目标页签：它由外侧栏唯一挂载，主画布不再挂第二枚 guest */
+  const fixSideTargetId = store.fixSide?.targetTabId
+  const fixSideOwnsTab = Boolean(gTab && fixSideTargetId && gTab.id === fixSideTargetId)
+  /**
+   * 这一格挂着的网页页签：WebTabLayer 常驻层只挂一份，切页签只藏不卸（见下）。
+   * side / fixside 的目标页签由各自的外侧栏唯一挂载，主画布不再挂第二枚 guest。
+   */
+  const gWebTabs = gVisibleTabs
+    .filter((x): x is WebTab => x.ref.kind === 'web')
+    .filter((x) => x.id !== gSideTarget?.id && x.id !== fixSideTargetId)
   /** 这一格挂着的视频页签（含创建态）：VideoTabLayer 常驻，切页签只藏不卸（用户定的 keepalive） */
   const gVideoTabs = (g.group?.tabs ?? []).filter((x): x is VideoTab => x.ref.kind === 'video')
   /** 视频页签的五个写库回调（按格现造：onCreate 要关掉本格的草稿页签），见 workspace/videoTabBridge */
@@ -236,8 +236,6 @@ export function renderGroupBody(ctx: GroupBodyCtx) {
   const gTerminalTabs = (g.group?.tabs ?? []).filter((t) => t.ref.kind === 'terminal')
   /** 这一格挂着的智能体团队页签（按当前目标过滤后 keepalive 常驻保活，切走只藏不卸） */
   const gAgentTeamTabs = gVisibleTabs.filter((t) => t.ref.kind === 'agentTeam')
-  /** Vim :side 页签内传送目标（若当前页签未启用或目标已关闭则为 null） */
-  const gSideTarget = findSideTargetTab(docs, gTab)
   const gFileTabs = (g.group?.tabs ?? []).filter((x) => x.ref.kind === 'local' || x.ref.kind === 'ws')
   /** 这一格挂着的教学文档 / 笔记 / 超级文档页签：编辑态常驻层（EditorTabLayer）照此挂起 */
   const gEditorTabs = (g.group?.tabs ?? []).filter(
@@ -413,6 +411,16 @@ export function renderGroupBody(ctx: GroupBodyCtx) {
                   </button>
                 )}
               </div>
+            ) : fixSideOwnsTab ? (
+              <FixSideWebNotice
+                pure={pure}
+                onExitZen={toggleZen}
+                onReveal={() => {
+                  const latest = getLatest()
+                  if (!latest.fixSide) return
+                  set({ ...latest, fixSide: { ...latest.fixSide, collapsed: false } })
+                }}
+              />
             ) : null
           ) : gTab?.ref.kind === 'blank' ? (
             /*
@@ -510,9 +518,7 @@ export function renderGroupBody(ctx: GroupBodyCtx) {
                 set({ ...latest, classrooms: nextList })
               }}
               onOpenTab={(kind, targetId) => {
-                if (kind === 'classroomShowcase') {
-                  openTab({ kind: 'classroomShowcase', tag: targetId || undefined })
-                } else if (kind === 'doc') {
+                if (kind === 'doc') {
                   openTab({ kind: 'teach', nodeId: targetId })
                 } else if (kind === 'exam') {
                   const exam = store.exams.find((e) => e.id === targetId)
@@ -531,25 +537,32 @@ export function renderGroupBody(ctx: GroupBodyCtx) {
               }}
               onGenerateClassroom={canvasChannel?.onGenerateClassroom}
             />
-          ) : gTab?.ref.kind === 'classroomShowcase' ? (
-            /*
-              课堂组件与动效库全屏页面：组件渲染参考、交互演练与动态创作中心。
-            */
-            <ClassroomShowcasePage initialTag={gTab.ref.tag} />
           ) : gTab?.ref.kind === 'agentTeam' ? (
             /* 智能体团队页面：由下方的常驻保活层（keepalive）接管，切页签只藏不卸，这里让出位置 */
             null
-          ) : gTab?.ref.kind === 'settings' ? (
+          ) : gTab?.ref.kind === 'settings' || gTab?.ref.kind === 'agentSettings' ? (
             /*
-              设置面板：文档区的一枚页签（不再是弹窗）。全局只有这一份（tabKey 恒定），
-              从任何入口打开都是切到它；分页与内容都在面板内部（见 settings/SettingsPanel）。
+              设置页：常规与全局智能体设置合并成一枚页签（tabKey 恒定）。
+              左上角分页切换；旧 agentSettings 页签迁移后也落到同一页的智能体分页。
             */
-            <SettingsPanel
-              onRootChanged={onRootChanged}
-              onToast={onToast}
-              scheduleSound={store.schedule?.sound}
-              onScheduleSoundChange={scheduleActions.setSound}
-              onSwitchSection={(sec) => openTab({ kind: sec === 'agent' ? 'agentSettings' : 'settings' })}
+            <SettingsPage ctx={ctx} initialSection={gTab.ref.kind === 'agentSettings' ? 'agent' : undefined} />
+          ) : gTab?.ref.kind === 'prompt' ? (
+            /* 内置提示词只读页：内容与设置页清单同源，外置文件走普通本地 md 页签 */
+            <PromptFileView
+              agentId={gTab.ref.agentId}
+              layer={gTab.ref.layer}
+              fileId={gTab.ref.fileId}
+              onBack={() =>
+                returnToAgentPage({
+                  groupId,
+                  promptTabId: gTab.id,
+                  agentTabs: gAgentTeamTabs,
+                  activeGoalId,
+                  activateTab,
+                  openTab,
+                  closeTab,
+                })
+              }
             />
           ) : gTab?.ref.kind === 'mind' ? (
             /*
@@ -567,34 +580,6 @@ export function renderGroupBody(ctx: GroupBodyCtx) {
               onDelete={memoryDelete}
               onClearWork={memoryClearWork}
               onToast={onToast}
-            />
-          ) : gTab?.ref.kind === 'agentSettings' ? (
-            /*
-              超级导师设置：原先是弹窗，现在是文档区的一枚页签。数据是 agent/settings
-              那一份（与全局设置分开），改动当场生效。
-            */
-            <AgentSettingsPanel
-              settings={agentSettings}
-              hasKey={hasKey}
-              model={globalSummary()}
-              onChange={(next) => {
-                saveAgentSettings(next)
-                onToast(t('超级导师设置已保存'))
-              }}
-              onOpenContextDebugger={() => debugWin.setOpen(true)}
-              onOpenContextTrace={openContextTrace}
-              flowRows={workflowRows}
-              onRunWorkflow={runWorkflowRow}
-              onRemoveWorkflow={removeWorkflowRow}
-              goals={store.goals}
-              memory={store.memory ?? { long: [], work: {} }}
-              activeGoalId={activeGoalId}
-              onMemoryCreate={memoryCreate}
-              onMemoryUpdate={memoryUpdate}
-              onMemoryDelete={memoryDelete}
-              onMemoryClearWork={memoryClearWork}
-              onToast={onToast}
-              onSwitchSection={(sec) => openTab({ kind: sec === 'agent' ? 'agentSettings' : 'settings' })}
             />
           ) : gTab?.ref.kind === 'draft' ? (
             /*

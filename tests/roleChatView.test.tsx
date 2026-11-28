@@ -1,0 +1,217 @@
+// @vitest-environment happy-dom
+/**
+ * chat 层：用户第一人称、名字来自用户模块 / agent profile，不用「我」。
+ */
+import { createElement, act } from 'react'
+import { createRoot } from 'react-dom/client'
+import { describe, expect, it } from 'vitest'
+import { RoleChatView } from '../src/components/agent/panel/RoleChatView'
+import type { ChannelMessage } from '../src/agent/types'
+
+const channel = (id: string, kind: 'user' | 'agent', direction: 'in' | 'out', from: string, text: string): ChannelMessage => ({
+  id,
+  kind,
+  direction,
+  from: { kind: kind === 'user' ? 'user' : 'role', id: from, name: from },
+  to:
+    kind === 'user' && direction === 'in'
+      ? { kind: 'role', id: 'tutor', name: '导师龟' }
+      : { kind: 'user', id: 'u1', name: 'Maxwell' },
+  text,
+  ts: 1000,
+})
+
+const roleOut = (id: string, from: string, text: string): ChannelMessage => ({
+  id,
+  kind: 'user',
+  direction: 'out',
+  from: { kind: 'role', id: from, name: from },
+  to: { kind: 'user', id: 'u1', name: 'Maxwell' },
+  text,
+  ts: 1000,
+})
+
+describe('RoleChatView', () => {
+  it('用户消息按用户模块的名字显示；agent 消息显示真名，不再用「我」', () => {
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const root = createRoot(host)
+    act(() => {
+      root.render(
+        createElement(RoleChatView, {
+          channels: [
+            channel('c1', 'user', 'in', '用户', '用户说的话'),
+            channel('c2', 'user', 'out', '导师龟', 'agent 的回复'),
+          ],
+          agentName: '导师龟',
+          agentAvatarId: undefined,
+          agentVoice: 'tutor',
+        }),
+      )
+    })
+
+    expect(host.textContent).toContain('用户说的话')
+    expect(host.textContent).toContain('agent 的回复')
+    expect(host.textContent).toContain('导师龟')
+    expect(host.textContent).not.toContain('我')
+    // 用户模块没有加载时也走「未命名用户」，而不是历史信封里硬编码的“用户”
+    expect(host.textContent).toContain('未命名用户')
+    // 气泡上方、时间右侧标明收件人：用户发给导师，agent 回复给用户
+    expect(host.textContent).toContain('> 导师龟')
+    expect(host.textContent).toContain('> 未命名用户')
+    // 两侧都有头像位（agent 图标 / 用户兜底图标）
+    expect(host.querySelectorAll('svg, img').length).toBeGreaterThanOrEqual(2)
+
+    act(() => {
+      root.unmount()
+    })
+    host.remove()
+  })
+
+  it('agent 名字后显示工作中，双层汇报默认只显示外层并可展开', () => {
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const root = createRoot(host)
+    const m: ChannelMessage = roleOut(
+      'c1',
+      '导师龟',
+      '极限讲义更新了。\n\n---\n\n补了定义，也补了两道例题。',
+    )
+    act(() => {
+      root.render(
+        createElement(RoleChatView, {
+          channels: [m],
+          agentName: '导师龟',
+          agentVoice: 'tutor',
+          agentRunning: true,
+        }),
+      )
+    })
+    expect(host.querySelector('[data-agent-status="running"]')?.textContent).toContain('工作中')
+    expect(host.textContent).toContain('极限讲义更新了。')
+    // 气泡不再用 whitespace-pre-wrap：那会把 Markdown HTML 末尾的换行渲染成底部空行
+    const bubble = host.querySelector('[data-role-bubble]')
+    expect(bubble?.className).not.toContain('whitespace-pre-wrap')
+    expect(host.textContent).not.toContain('补了定义')
+    act(() => {
+      host.querySelector<HTMLButtonElement>('[data-bubble-detail-toggle]')?.click()
+    })
+    expect(host.textContent).toContain('补了定义')
+    act(() => {
+      root.unmount()
+    })
+    host.remove()
+  })
+
+
+  it('私聊只显示 user 通道：agent 内部转交不进入对话列表', () => {
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const root = createRoot(host)
+    act(() => {
+      root.render(
+        createElement(RoleChatView, {
+          channels: [
+            channel('c1', 'user', 'in', '用户', '用户说的话'),
+            channel('c2', 'agent', 'out', '导师龟', '这是内部转交，不该出现在私聊'),
+          ],
+          agentName: '导师龟',
+          agentVoice: 'tutor',
+        }),
+      )
+    })
+    expect(host.textContent).toContain('用户说的话')
+    expect(host.textContent).not.toContain('内部转交')
+    act(() => {
+      root.unmount()
+    })
+    host.remove()
+  })
+
+  it('不同 role 的回复按 from.id 取自己的名字与头像，不共用当前页签的兜底', () => {
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const root = createRoot(host)
+    act(() => {
+      root.render(
+        createElement(RoleChatView, {
+          channels: [
+            channel('c1', 'user', 'in', '用户', '用户说的话'),
+            roleOut('c2', 'tutor', '导师龟的回复'),
+            roleOut('c3', 'dispatcher', '经理龟的回复'),
+          ],
+          agentName: '导师龟',
+          agentAvatarId: 'turtle-tutor',
+          agentVoice: 'tutor',
+          agentNames: { tutor: '导师龟', dispatcher: '经理龟' },
+          agentAvatars: { tutor: 'turtle-tutor', dispatcher: 'turtle-dispatcher' },
+        }),
+      )
+    })
+    expect(host.textContent).toContain('导师龟的回复')
+    expect(host.textContent).toContain('经理龟的回复')
+    expect(host.textContent).toContain('经理龟')
+    const images = Array.from(host.querySelectorAll('img')).map((img) => img.getAttribute('src'))
+    expect(new Set(images).size).toBeGreaterThanOrEqual(2)
+    act(() => {
+      root.unmount()
+    })
+    host.remove()
+  })
+
+  it('用户私聊消息带附件引用时，气泡里画出媒体宫格', () => {
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const root = createRoot(host)
+    const m: ChannelMessage = {
+      ...channel('c1', 'user', 'in', '用户', '这张图里是什么？'),
+      attachments: {
+        images: [
+          {
+            id: 'img-1',
+            rel: 'docs/高等数学/static/img-1.png',
+            name: '截图',
+            mime: 'image/png',
+            bytes: 1234,
+          },
+        ],
+      },
+    }
+    act(() => {
+      root.render(
+        createElement(RoleChatView, {
+          channels: [m],
+          agentName: '导师龟',
+          agentVoice: 'tutor',
+        }),
+      )
+    })
+    expect(host.querySelector('button[title*="截图"]')).not.toBeNull()
+    expect(host.textContent).toContain('这张图里是什么？')
+    act(() => {
+      root.unmount()
+    })
+    host.remove()
+  })
+
+  it('对话页不再渲染 work 窗口', () => {
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const root = createRoot(host)
+    act(() => {
+      root.render(
+        createElement(RoleChatView, {
+          channels: [roleOut('c2', '导师龟', '先看一眼手上的活')],
+          agentName: '导师龟',
+          agentVoice: 'tutor',
+        }),
+      )
+    })
+    expect(host.querySelector('[data-work-window-stub]')).toBeNull()
+    expect(host.querySelector('[data-work-dispatch-list]')).toBeNull()
+    act(() => {
+      root.unmount()
+    })
+    host.remove()
+  })
+})

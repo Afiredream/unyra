@@ -3,6 +3,7 @@ import { Annotation, Compartment, EditorState, type Extension } from '@codemirro
 import { EditorView, keymap, placeholder as cmPlaceholder, lineNumbers, highlightActiveLine, highlightActiveLineGutter, drawSelection } from '@codemirror/view'
 import { closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete'
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands'
+import { AlignLeft, Loader2 } from 'lucide-react'
 import {
   createRestoredEditorState,
   debouncedSaveEditorHistory,
@@ -23,6 +24,7 @@ import {
 import { markdown, markdownLanguage } from '@codemirror/lang-markdown'
 import { languages as codeLanguages } from '@codemirror/language-data'
 import { countSourceWords } from '../../lib/wordCount'
+import { useSourceFormat } from './useSourceFormat'
 import { installVimPromptBridge } from '../../lib/commandBarFocus'
 import { getAppearance, setAppearance, clampEditorScale, SCALE_ZOOM_STEP, SCALE_HUD_MS } from '../../lib/appearance'
 import { markdownEditorTheme, markdownHighlight } from '../../lib/cmMarkdown'
@@ -36,6 +38,7 @@ import { onVimModeChanged } from '../../lib/imeSwitch'
 import { loadAndApplyVimrc } from '../../lib/vimConfig'
 import { registerVimExCommands, setVimEditorBridge } from '../../lib/vimCommands'
 import { foldCurrentScope, unfoldCurrentScope } from '../../lib/cmFoldScope'
+import { bindingOf, comboFromEvent, formatCombo } from '../../lib/shortcuts'
 import { takeSourceReveal, subscribeSourceReveal, type SourceReveal } from '../../lib/docReveal'
 import { useDocScroll } from '../../lib/docScroll'
 import { EditorCursorBindingContext } from './editor/LiveSplitPreview'
@@ -145,6 +148,36 @@ interface Props {
   historyKey?: string
 }
 
+/**
+ * 折叠 / 展开当前代码块的快捷键**不在 CodeMirror 里写死**：设置面板改键后，
+ * 这里每次按键都读注册表当前组合（bindingOf），旧组合立刻失效。
+ *
+ * 为什么不用全局 useShortcut：分屏可以同时开多个 SourceEditor，而 lib/shortcuts
+ * 的 handlers 每个 id 只留一个订阅；放在每个 EditorView 的 DOM handler 上才能
+ * 让焦点所在的那一屏自己折叠，也不和别的编辑器抢注册。
+ */
+const foldShortcutHandler = EditorView.domEventHandlers({
+  keydown: (event, view) => {
+    if (event.defaultPrevented || event.isComposing) return false
+    // 只接管带 Ctrl / Alt / Meta 的组合：裸键与 Shift+键是编辑器输入，不能抢。
+    if (!event.ctrlKey && !event.altKey && !event.metaKey) return false
+    const combo = comboFromEvent(event)
+    if (!combo) return false
+    const comboText = formatCombo(combo)
+    if (comboText === bindingOf('source.foldCurrent')) {
+      event.preventDefault()
+      foldCurrentScope(view)
+      return true
+    }
+    if (comboText === bindingOf('source.unfoldCurrent')) {
+      event.preventDefault()
+      unfoldCurrentScope(view)
+      return true
+    }
+    return false
+  },
+})
+
 export default function SourceEditor({
   value,
   onChange,
@@ -175,9 +208,26 @@ export default function SourceEditor({
   /** 上层给进来的最新 value：updateListener 里只把「用户真的改了」交出去 */
   const valueRef = useRef(value)
   const changeRef = useRef(onChange)
+  const labelRef = useRef(label)
+  const extRef = useRef(ext)
+  const readOnlyRef = useRef(readOnly)
+  const { formatting, formatNote, canFormat, handleFormat, formatActionRef } = useSourceFormat({
+    viewRef,
+    ext,
+    label,
+    readOnly,
+    extRef,
+    labelRef,
+    readOnlyRef,
+  })
   useEffect(() => {
     changeRef.current = onChange
   }, [onChange])
+  useEffect(() => {
+    labelRef.current = label
+    extRef.current = ext
+    readOnlyRef.current = readOnly
+  }, [label, ext, readOnly])
 
   // 双栏实时预览光标位置绑定
   const onCursorRatio = useContext(EditorCursorBindingContext)
@@ -220,37 +270,16 @@ export default function SourceEditor({
 
     const editorExtensions = [
       history(),
-          keymap.of([
-            // Ctrl- 与 Ctrl=：快速折叠/展开当前光标所在代码块（同时拦截默认网页缩放）
-            {
-              key: 'Mod--',
-              run: (view) => {
-                foldCurrentScope(view)
-                return true
-              },
-            },
-            {
-              key: 'Mod-=',
-              run: (view) => {
-                unfoldCurrentScope(view)
-                return true
-              },
-            },
-            {
-              key: 'Mod-_',
-              run: (view) => {
-                foldCurrentScope(view)
-                return true
-              },
-            },
-            {
-              key: 'Mod-+',
-              run: (view) => {
-                unfoldCurrentScope(view)
-                return true
-              },
-            },
+      foldShortcutHandler,
+      keymap.of([
             indentWithTab,
+            {
+              key: 'Shift-Alt-f',
+              run: () => {
+                formatActionRef.current()
+                return true
+              },
+            },
             ...closeBracketsKeymap,
             ...foldKeymap,
             ...defaultKeymap,
@@ -753,6 +782,24 @@ export default function SourceEditor({
         title={label}
         className="no-print pointer-events-none absolute inset-x-0 bottom-0 z-20 flex h-6 items-center justify-end gap-1.5 border-t border-line/40 bg-card/85 px-3 text-[11px] text-ink-faint backdrop-blur-xs select-none"
       >
+        {canFormat && (
+          <button
+            type="button"
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={() => void handleFormat()}
+            disabled={formatting}
+            title={t('格式化源码 (Shift+Alt+F)')}
+            className="pointer-events-auto mr-auto flex h-[18px] items-center gap-1 rounded border border-line/60 bg-paper/60 px-1.5 text-[10.5px] text-ink-soft transition hover:border-line-strong hover:bg-line/30 hover:text-ink disabled:opacity-50"
+          >
+            {formatting ? <Loader2 size={10} className="animate-spin" /> : <AlignLeft size={10} />}
+            {formatting ? t('格式化中…') : t('格式化')}
+          </button>
+        )}
+        {formatNote && (
+          <span className={formatNote.tone === 'warn' ? 'mr-1 text-warn-deep' : 'mr-1 text-ink-faint'}>
+            {formatNote.text}
+          </span>
+        )}
         {vimActive && (
           <>
             <span className="font-mono text-[11px] font-bold text-seal select-none">VIM</span>

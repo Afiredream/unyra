@@ -45,12 +45,12 @@ export function favoriteKeyOfTab(ref: TabRef): string | null {
     ref.kind === 'schedule' ||
     ref.kind === 'mind' ||
     ref.kind === 'agentSettings' ||
+    ref.kind === 'prompt' ||
     ref.kind === 'guide' ||
     ref.kind === 'blank' ||
     ref.kind === 'draft' ||
     ref.kind === 'ws' ||
     ref.kind === 'classroom' ||
-    ref.kind === 'classroomShowcase' ||
     ref.kind === 'agentTeam'
   )
     return null
@@ -73,12 +73,12 @@ export function favoriteRefOfTab(ref: TabRef): FavoriteRef | null {
     ref.kind === 'schedule' ||
     ref.kind === 'mind' ||
     ref.kind === 'agentSettings' ||
+    ref.kind === 'prompt' ||
     ref.kind === 'guide' ||
     ref.kind === 'blank' ||
     ref.kind === 'draft' ||
     ref.kind === 'ws' ||
     ref.kind === 'classroom' ||
-    ref.kind === 'classroomShowcase' ||
     ref.kind === 'agentTeam'
   )
     return null

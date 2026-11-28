@@ -14,10 +14,11 @@ import {
   type ConversationMessage,
   type MessageImage,
 } from '../../agent/types'
-import type { ChatMessage } from '../../ai/types'
+import type { ChatMessage, ServerToolStep } from '../../ai/types'
 import { budgetChars, imagePart, textPart } from '../../ai/content'
-import { fileBlock } from '../attachments'
+import { attachmentMetaBlock, fileBlock } from '../attachments'
 import { summaryBlock } from '../compact'
+import { channelTextOf } from '../roleWork/channels'
 
 /**
  * 送入模型的历史预算（字符数）。不是「最近 N 条」——按条数裁剪会让前缀每轮都变：
@@ -54,7 +55,15 @@ export function toChatHistory(
    * 做成一个选项对象而不是第三、第四个位置参数：这一层已经有两个可选参数了，
    * 再加位置参数，调用点上就分不清哪个是哪个。
    */
-  opts?: { files?: Map<string, string>; summary?: ContextSummary },
+  opts?: {
+    files?: Map<string, string>
+    summary?: ContextSummary
+    /**
+     * role 层专用：用户消息只带附件元信息，不把图片字节与文件正文挂进请求。
+     * work 拿原消息引用去读实际内容；role 想知道内容只能把消息交给 work。
+     */
+    omitUserAttachments?: boolean
+  },
 ): ChatMessage[] {
   /*
    * 压缩过的历史：**失活的消息一条都不发**，摘要作为第一条用户消息接在最前面
@@ -67,12 +76,23 @@ export function toChatHistory(
     if (m.retired) continue
     if (m.role === 'user') {
       const text = m.parts.filter((p) => p.type === 'text').map((p) => p.text).join('')
-      const pics = (m.images ?? [])
-        .map((img) => images?.get(img.id))
-        .filter((p): p is { mime: string; data: string } => !!p)
+      const pics = opts?.omitUserAttachments
+        ? []
+        : (m.images ?? [])
+            .map((img) => images?.get(img.id))
+            .filter((p): p is { mime: string; data: string } => !!p)
       // 附件的正文接在用户那句话之后、位置说明之前：先看他问了什么、附了什么，再看「此刻在哪个节点」
-      const attach = m.files?.length ? fileBlock(m.files, opts?.files ?? new Map()) : ''
-      const body = withContext([text, attach].filter(Boolean).join('\n\n'), m.context)
+      // role 层只接元信息（文件名 / 体积 / 尺寸），图片字节与文件全文一律不挂。
+      const attach = opts?.omitUserAttachments
+        ? attachmentMetaBlock(m.images ?? [], m.files ?? [], {
+            totalFiles: m.files?.length ?? 0,
+            ...(m.channel?.envelopeId ? { messageId: m.channel.envelopeId } : {}),
+          })
+        : m.files?.length
+          ? fileBlock(m.files, opts?.files ?? new Map())
+          : ''
+      const stamped = m.channel ? channelTextOf(m.channel, text) : text
+      const body = withContext([stamped, attach].filter(Boolean).join('\n\n'), m.context)
       // 片段顺序：先文字后图片。顺序一旦定下就不能再改——历史要逐字节稳定
       out.push({
         role: 'user',
@@ -96,17 +116,19 @@ export function toChatHistory(
     for (const seg of hopSegments(m.parts)) {
       const text = seg.filter((p) => p.type === 'text').map((p) => p.text).join('')
       const calls = seg.filter((p): p is Extract<AgentPart, { type: 'tool' }> => p.type === 'tool')
+      const webs = seg.filter((p): p is Extract<AgentPart, { type: 'web' }> => p.type === 'web')
       /**
        * 本跳的思考原文：思考模型的回传契约（GLM/DeepSeek V4 缺了直接 400）。各 delta
        * 按到达顺序合并，与 agent/runtime 实发 push 的 result.reasoning 逐字节一致；
        * 键序（content 之后、tool_calls 之前）也要一致——前缀门禁按整消息 JSON 比对。
        */
       const thinking = seg.filter((p) => p.type === 'thinking').map((p) => p.text).join('')
-      if (text || calls.length) {
+      if (text || calls.length || webs.length) {
         out.push({
           role: 'assistant',
           content: text || null,
           ...(thinking ? { reasoning_content: thinking } : {}),
+          ...(webs.length ? { server_tool_calls: serverStepsOf(webs) } : {}),
           ...(calls.length
             ? {
                 tool_calls: calls.map((t) => ({
@@ -166,10 +188,10 @@ export function toChatHistory(
           out.push({ role, content: p.text })
         }
         /**
-         * 委托交付（team.complete，见 learn/agentTeam/delegations）：实发侧按 user 角色
-         * push（pushInjection 对 user 恒不降级），还原同样恒为 user——逐字节镜像。
+         * 通道消息（role-work 的 Work / Agent 通道）：实发侧按 user 角色 push
+         * （pushInjection 对 user 恒不降级），还原同样恒为 user——逐字节镜像。
          */
-        if (p.type === 'team-delivery') {
+        if (p.type === 'channel-message') {
           out.push({ role: 'user', content: p.text })
         }
       }
@@ -193,6 +215,25 @@ function hopSegments(parts: AgentPart[]): AgentPart[][] {
     segs[segs.length - 1].push(p)
   }
   return segs
+}
+
+/**
+ * 把界面上的 web 片段还原成服务端 `server_tool_calls` 的步骤结构。
+ * 同一步的多个呼叫按出现顺序合并；`reasoning` 是服务端给这一步的思考原文，
+ * 回传时不能丢——signature 与它一起决定上一轮读过的网页还在不在上下文里。
+ */
+function serverStepsOf(webs: Array<Extract<AgentPart, { type: 'web' }>>): ServerToolStep[] {
+  const steps = new Map<number, ServerToolStep>()
+  for (const w of webs) {
+    const step = steps.get(w.step) ?? {
+      index: w.step,
+      ...(w.reasoning !== undefined ? { reasoningContent: w.reasoning } : {}),
+      calls: [],
+    }
+    step.calls.push(w.call)
+    steps.set(w.step, step)
+  }
+  return [...steps.values()].sort((a, b) => a.index - b.index)
 }
 
 /**
@@ -225,6 +266,7 @@ function dropOrphans(history: ChatMessage[]): ChatMessage[] {
         role: 'assistant',
         content: m.content,
         ...(m.reasoning_content !== undefined ? { reasoning_content: m.reasoning_content } : {}),
+        ...(m.server_tool_calls?.length ? { server_tool_calls: m.server_tool_calls } : {}),
       })
       continue
     }
@@ -240,7 +282,9 @@ function dropOrphans(history: ChatMessage[]): ChatMessage[] {
 function withinBudget(history: ChatMessage[]): ChatMessage[] {
   // 图片按 base64 长度计入：一张图往往比一整段文字还重，先丢它才划算
   // 图片按张数折算，不按 base64 长度——否则一张大图就能把整段历史（含本次提问）顶掉
-  const size = (m: ChatMessage) => budgetChars(m.content)
+  // server_tool_calls 里的 signature 也是实打实占上下文，按 JSON 长度计入
+  const size = (m: ChatMessage) =>
+    budgetChars(m.content) + (m.server_tool_calls ? JSON.stringify(m.server_tool_calls).length : 0)
   let chars = history.reduce((sum, m) => sum + size(m), 0)
   let start = 0
   while (start < history.length && chars > MAX_HISTORY_CHARS) {

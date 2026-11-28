@@ -126,7 +126,7 @@ describe('页签的身份', () => {
     expect(tabTrail(mind, () => '极限', (gid) => '目标' + gid)).toBe('目标g1')
     expect(tabTitle(mind, () => '随便')).toBe('记忆管理')
     const agentSettings: TabRef = { kind: 'agentSettings' }
-    expect(tabKey(agentSettings)).toBe('set:agent')
+    expect(tabKey(agentSettings)).toBe('set:settings')
     expect(tabNodeId(agentSettings)).toBeNull()
     expect(tabTitle(agentSettings, () => '随便')).toBe('超级导师设置')
     const outlineGoal: TabRef = { kind: 'outline', nodeId: 'g1', goalId: 'g1' }
@@ -284,6 +284,27 @@ describe('拖动排序与左右切换', () => {
     expect(reorderTabs(list, [b.id, b.id, a.id]).map((t) => t.id)).toEqual([b.id, a.id, c.id])
     // 空列表：原样返回
     expect(reorderTabs(list, []).map((t) => t.id)).toEqual([a.id, b.id, c.id])
+  })
+
+  it('智能体团队固定页签始终排在结构（大纲）固定页签之前', () => {
+    const doc = tab({ kind: 'teach', nodeId: 'a' })
+    const oTab = tab({ kind: 'outline', nodeId: 'n1' })
+    const teamTab = tab({ kind: 'agentTeam', goalId: 'g1' })
+    // 物理顺序里团队在结构之后：重排时被提到结构之前
+    expect(reorderTabs([doc, oTab, teamTab], [doc.id, oTab.id, teamTab.id]).map((t) => t.id)).toEqual([
+      teamTab.id,
+      oTab.id,
+      doc.id,
+    ])
+    // 拖拽 / 落盘状态里排成什么样，读回来也钉回这个相对顺序
+    expect(reorderTabs([oTab, teamTab, doc], [oTab.id, teamTab.id, doc.id]).map((t) => t.id)).toEqual([
+      teamTab.id,
+      oTab.id,
+      doc.id,
+    ])
+    // 没有团队页签时其余固定页签的相对位置不动
+    const pinnedDoc = { ...tab({ kind: 'teach', nodeId: 'b' }), pinned: true }
+    expect(reorderTabs([oTab, pinnedDoc], [oTab.id, pinnedDoc.id]).map((t) => t.id)).toEqual([oTab.id, pinnedDoc.id])
   })
 
   it('循环切换：到头绕回另一端', () => {

@@ -10,7 +10,7 @@
  */
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { bottomGap, isAtBottom, isUserScrollUp, shouldDetachByWheel } from '../../../lib/scrollFollow'
+import { bottomGap, isAtBottom, isNearBottomForNewMessage, isUserScrollUp, shouldDetachByWheel } from '../../../lib/scrollFollow'
 import {
   SCALE_HUD_MS,
   SCALE_ZOOM_STEP,
@@ -30,8 +30,12 @@ export interface ScrollFollow {
   jumpToMessage: (id: string) => void
   /** 回到最新：平滑滚到底并恢复跟随 */
   restoreFollow: () => void
+  /** 换会话：立刻落到底并恢复跟随（无动画） */
+  resetFollow: () => void
   /** 跟随状态下，内容每长一点就贴到底部（调用方在条数 / 流式内容 / 在不在跑变化时调） */
   stickToBottom: () => void
+  /** 新增消息且视口离底部 ≤400px 时主动落底；返回是否滚了 */
+  stickToBottomIfNear: () => boolean
   /** 刚从定位条跳过来的那条消息：闪一下（消息列表据此加类） */
   flashId: string | null
   /** 对话区文字大小系数（Ctrl + 滚轮调） */
@@ -327,6 +331,31 @@ export function useScrollFollow(
   }
 
   /**
+   * 新增消息专用：当前视口离底部 ≤400px 时，主动落底并恢复跟随。
+   *
+   * 与 stickToBottom 分开：那个只在已 pinned 时动，管的是流式长高；
+   * 这个是一次性的「新消息到了」判据，用户即使已经往上翻了几百像素，只要仍在
+   * 最新内容附近，就该接上新消息，而不是把他留在半路。
+   */
+  const stickToBottomIfNear = (): boolean => {
+    const el = scrollRef.current
+    if (!el || !isNearBottomForNewMessage(bottomGap(el))) return false
+    restoreFollow()
+    return true
+  }
+
+  /**
+   * 换会话 / 换频道：**立刻**落到底并恢复跟随（不走平滑动画）。
+   * 新列表的第一帧不该看到一段从顶上滑下来的动画；滚动位置也顺便归位。
+   */
+  const resetFollow = () => {
+    pinnedRef.current = true
+    setPinned(true)
+    const el = scrollRef.current
+    if (el) el.scrollTop = el.scrollHeight
+  }
+
+  /**
    * 滚轮累计到阈值就脱离自动滚动。
    * 往下滚要把累计清零：那说明他正往回走，不该攒着上一次的额度把他踢出去。
    */
@@ -386,7 +415,9 @@ export function useScrollFollow(
     pinned,
     jumpToMessage,
     restoreFollow,
+    resetFollow,
     stickToBottom,
+    stickToBottomIfNear,
     flashId,
     chatScale,
     zoomPct,

@@ -18,6 +18,7 @@
 import { useCallback, useEffect, useMemo, useRef } from 'react'
 import {
   type AgentPart,
+  type ChannelStamp,
   type Conversation,
   type ConversationMessage,
   type MessageFile,
@@ -28,17 +29,8 @@ import {
 } from '../../agent/types'
 import type { AskAnswers, ExamToolDeps } from '../../agent/tools'
 import { hasApiKey, loadAiSettings } from '../../ai/settings'
-import { freeConversationById, getFreeConversations } from '../freeChat'
-import {
-  delegationTurnText,
-  onAgentTeamTurnStarted,
-  onConversationTurnClosed,
-  setAgentTeamDispatcher,
-  takeDeliveryInjection,
-  type AgentTeamDispatcher,
-} from '../agentTeam/delegations'
-import type { AgentVoice } from '../../agent/agentProfile'
-import { delegationConversationId, resolveVoiceConversation, voiceOfConversation } from '../agentTeam/voiceConvs'
+import { freeConversationById, getFreeConversations, mutateFreeConversation } from '../freeChat'
+import { type AgentVoice } from '../../agent/agentProfile'
 import { setEffortContextProbe } from '../effortGuard'
 import type { LearnStore } from '../types'
 import { conversationById, nodeById } from '../graph'
@@ -48,6 +40,16 @@ import { transferPendingFiles, transferPendingImages } from '../agent/transfer'
 import type { AgentRunTarget, AgentUiDeps } from '../agent/sandboxOps'
 import { activeMessages } from '../compact'
 import { missingPromptModules, promptModuleMessage, type PromptModule } from '../ai/promptModules'
+import type { AgentProfileId } from '../../agent/agentProfile'
+import type { RoleWorkDispatcher } from '../roleWork/dispatch'
+import { roleOfConversation } from '../roleWork/roles'
+import {
+  flushChannelInbox,
+  setRoleWorkDispatcher,
+  takeChannelInjection,
+} from '../roleWork/dispatch'
+import { inboundMessage, withUserEnvelopeAttachments } from '../roleWork/channels'
+import { pauseAskTimer, resumeAskTimer } from '../roleWork/askTimers'
 import { useAgentSlots } from './slots'
 import { useAgentSession } from './session'
 import { assembleTurnEntry } from './agentPrompt'
@@ -122,9 +124,9 @@ export function useAgent(opts: {
     setTps,
     liveUsage,
     setLiveUsage,
-    subRuns,
-    setSubRuns,
-    subManagersRef,
+    workRuns,
+    setWorkRuns,
+    workManagersRef,
   } = useAgentSlots()
   const onNeedKeyRef = useRef(onNeedKey)
   /** 转存失败之类的话要能说出来，但不该进 runTurn 的依赖（回调每次渲染都是新的） */
@@ -163,10 +165,9 @@ export function useAgent(opts: {
   useEffect(
     () => () => {
       for (const c of abortMapRef.current.values()) c.abort()
-      for (const m of subManagersRef.current.values()) m.abortAll()
+      for (const m of workManagersRef.current.values()) m.abortAll()
     },
-    // 两个都是跨渲染稳定的 ref：列进依赖不改变「只在卸载时清理」的行为
-    [abortMapRef, subManagersRef],
+    [abortMapRef, workManagersRef],
   )
 
   const conversation = useMemo<Conversation | null>(
@@ -175,7 +176,12 @@ export function useAgent(opts: {
   )
 
   // 会话级副作用（落库 / 起名 / 子代理管理器）整段在 useAgent/session；namingRef 由自由聊天共用
-  const { persist, namingRef, nameConversation, getOrCreateSubManager } = useAgentSession({ getLatest, set, subManagersRef, setSubRuns })
+  const { persist, namingRef, nameConversation, getOrCreateWorkManager, getOrCreateFreeWorkManager } = useAgentSession({
+    getLatest,
+    set,
+    workManagersRef,
+    setWorkRuns,
+  })
 
   /** 用户在表单卡里点了「提交」：把答案交回给阻塞中的沙箱（缺省 = 当前会话挂着的那一张） */
   const submitAsk = useCallback(
@@ -202,6 +208,47 @@ export function useAgent(opts: {
     // askWaitersRef 是跨渲染稳定的 ref：列进依赖不改变记忆化行为
     [pendingAsk, conversationId, askWaitersRef],
   )
+
+  /** 气泡里的 ask 不依赖 pendingAsk（work 发起的问询不在 role 的表单槽里） */
+  const submitAskById = useCallback(
+    (askId: string, answers: AskAnswers) => {
+      askWaitersRef.current.get(askId)?.({ ok: true, cancelled: false, answers })
+    },
+    [askWaitersRef],
+  )
+
+  const cancelAskById = useCallback(
+    (askId: string) => {
+      askWaitersRef.current.get(askId)?.({
+        ok: true,
+        cancelled: true,
+        answers: [],
+        note: '用户取消了表单，没有给出任何回答。不要假设他的偏好或答案。',
+      })
+    },
+    [askWaitersRef],
+  )
+
+  /** UI 倒计时走到 0 时先收口；宿主定时器随后会撞上同一个 waiter，不会重复。 */
+  const expireAskById = useCallback(
+    (askId: string) => {
+      askWaitersRef.current.get(askId)?.({
+        ok: false,
+        timedOut: true,
+        content: '表单已到时自动失效。不要假设用户的回答。',
+      })
+    },
+    [askWaitersRef],
+  )
+
+  /**
+   * 气泡悬停：暂停 / 恢复宿主侧的 ask 到期定时器。
+   * 只控制计时，不改变 ask 状态；真正的到期仍由 toolRig 的 settle 收口。
+   */
+  const setAskHover = useCallback((askId: string, hovering: boolean) => {
+    if (hovering) pauseAskTimer(askId)
+    else resumeAskTimer(askId)
+  }, [])
 
   /**
    * runTurn 的本体，不做并发控制（守卫与排队在 runTurn 里）。
@@ -239,10 +286,18 @@ export function useAgent(opts: {
       modules?: PromptModule[],
       /** 工作流启动实参（runWorkflow 的 params）：随隐藏指令落库，分界条展开时展示 */
       wfParams?: Record<string, string | number>,
+      /** 这条用户消息的来源通道（用户 / agent / work），写进消息后由 history 补时间戳 */
+      channel?: ChannelStamp,
+      /**
+       * 已经落过盘、只带引用的附件（群聊 / 渠道入站走这里）：
+       * 不再转存，直接把引用并进这一轮的用户消息。字节留在资源库，role 的历史里
+       * 只留元信息，work 拿 messageId 时才读内容。
+       */
+      known?: { images?: MessageImage[]; files?: MessageFile[] },
     ) => {
       const trimmed = text.trim()
       // 与 runTurn 同一道门：纯图片/纯文件（无字）放行——图片转存与消息组装都在后面
-      if (!trimmed && !(pending?.length || files?.length)) return
+      if (!trimmed && !(pending?.length || files?.length || known?.images?.length || known?.files?.length)) return
       const settings = loadAiSettings()
       const before = getLatest()
       if (!before.goals.some((g) => g.id === target.goalId)) return
@@ -265,11 +320,11 @@ export function useAgent(opts: {
       const allImages = [...(pending ?? []), ...imageFiles]
       const attached = allImages.length
         ? await transferPendingImages(getLatest, set, target.goalId, allImages)
-        : { images: [] as MessageImage[], error: undefined }
+        : { images: known?.images ?? ([] as MessageImage[]), error: undefined }
       const docFiles = (files ?? []).filter((x) => !x.image)
       const attachedFiles = docFiles.length
         ? await transferPendingFiles(getLatest, set, target.goalId, docFiles)
-        : { files: [] as MessageFile[], error: undefined }
+        : { files: known?.files ?? ([] as MessageFile[]), error: undefined }
       if (attachedFiles.error) onNoticeRef.current?.(attachedFiles.error)
 
       /**
@@ -278,9 +333,9 @@ export function useAgent(opts: {
        * 漏标的承接会话在这里就地补标（幂等；导师对话不写 voice，与老数据同形）。
        */
       const existing = conversationById(before, target.conversationId)
-      const derived = existing ? voiceOfConversation(existing) : (target.voice ?? 'tutor')
-      // store 里的会话不会是 free（仅聊天另存 freeChat）；类型面在这里收窄成执行声部
-      const voice: AgentVoice = derived === 'free' ? 'tutor' : derived
+      const voice: AgentVoice = existing
+        ? (roleOfConversation(existing) as AgentVoice)
+        : (target.voice ?? 'tutor')
       let conv = existing ?? {
         id: target.conversationId,
         goalId: target.goalId,
@@ -293,8 +348,15 @@ export function useAgent(opts: {
       if (voice !== 'tutor' && !conv.voice) conv = { ...conv, voice }
       // 入口组装（当轮用户消息 + 人格 / 格式 / 画像 / 技能 / MCP 各路补发，以及系统提示词
       // 的固化与 inflight 标记）整段在 assembleTurnEntry；这里只接回组装好的会话并落库。
-      const entry = assembleTurnEntry({ trimmed, hidden, mark, wfParams, context, quote, attached, attachedFiles, assistantId, voice, conv })
+      const entry = assembleTurnEntry({ trimmed, hidden, mark, wfParams, context, quote, attached, attachedFiles, assistantId, voice, conv, ...(channel ? { channel } : {}) })
       conv = entry.conv
+      /**
+       * 私聊页只读 channels，不读 messages：用户自己发的图片/文件在进入这一轮前只是
+       * PendingImage / PendingFile（还没有资源库引用），所以 AgentSlot 建 user 信封时
+       * 只能先写文字。转存完成后把同一枚信封补上 attachments，气泡才会画出宫格；
+       * 纯附件消息也靠这一步从「空信封」变成可见消息。
+       */
+      conv = withUserEnvelopeAttachments(conv, channel, attached.images, attachedFiles.files)
       // 工作流触发时随指令注入的规程模块（登记工作流的 prompt 字段）：作为隐藏
       // assistant 声明插在当轮指令之前——声明归 assistant 边、指令归 user（见
       // promptModuleMessage 的分工说明）。同一上下文同 key 只注一次，压缩折掉后自动补回。
@@ -319,6 +381,7 @@ export function useAgent(opts: {
         getLatest,
         set,
         target,
+        channel,
         settings,
         agentSettings: entry.agentSettings,
         wfParams,
@@ -332,7 +395,7 @@ export function useAgent(opts: {
         askWaitersRef,
         setPendingAsk,
         onNoticeRef,
-        getOrCreateSubManager,
+        workManager: getOrCreateWorkManager(target.conversationId),
       })
       const ctrl = rig.ctrl
       const parts: AgentPart[] = []
@@ -413,15 +476,15 @@ export function useAgent(opts: {
           setLiveUsage,
           scheduleFlush,
           /**
-           * 跳边界注入：委托交付回传（team.complete → 委托者运行中 → 单次 loop 结束后
-           * 插入接着继续运行，见 learn/agentTeam/delegations）。镜像纪律：交付全文记成
-           * team-delivery 片段挂在当前回复的跳边界上、随增量落库——toChatHistory 会在
-           * 同一位置重放同一条 user 消息，下一轮的前缀逐字节对得上。
+           * 跳边界注入：通道交付回传（work host.send / Agent 来信 → role 运行中 →
+           * 单次 loop 结束后插入，见 learn/roleWork/dispatch 与 agent/history）。
+           * 镜像纪律：交付全文记成 channel-message 片段挂在当前回复的跳边界上、随增量
+           * 落库——toChatHistory 会在同一位置重放同一条 user 消息，下一轮前缀逐字节对得上。
            */
           injections: async () => {
-            const delivery = takeDeliveryInjection(target.conversationId)
+            const delivery = takeChannelInjection(target.conversationId)
             if (!delivery) return null
-            parts.push({ type: 'team-delivery', delegationId: delivery.delegationId, text: delivery.text })
+            parts.push({ type: 'channel-message', channelId: delivery.envelopeId, text: delivery.text })
             const storedConv = conversationById(getLatest(), target.conversationId)
             if (storedConv) {
               persist(
@@ -465,13 +528,12 @@ export function useAgent(opts: {
           autoCompactRef,
           onNoticeRef,
         })
-        // 委托与自启动的收口接续（交付注入缓冲转激活 / 承接中的委托记账 / awake 计时 /
-        // 承接队列空闲启动，见 learn/agentTeam/delegations）
-        onConversationTurnClosed(target.conversationId)
+        // 通道收口：本轮若还有排着的通道消息，接着起下一轮（见 learn/roleWork/dispatch）
+        flushChannelInbox(target.conversationId)
       }
     },
     // 后面追加的全是跨渲染稳定的 ref / setState：列进依赖不改变记忆化行为（与拆分前一致）
-    [examDeps, getLatest, getOrCreateSubManager, nameConversation, persist, set, setStreaming, setRunning, setTps, setLiveUsage, setPendingAsk, abortMapRef, askWaitersRef, pendingWfRef, wfChainRef],
+    [examDeps, getLatest, getOrCreateWorkManager, nameConversation, persist, set, setStreaming, setRunning, setTps, setLiveUsage, setPendingAsk, abortMapRef, askWaitersRef, pendingWfRef, wfChainRef],
   )
 
   /**
@@ -495,19 +557,22 @@ export function useAgent(opts: {
       modules?: PromptModule[],
       /** 工作流启动实参（见 runTurnUnchecked 同名参数） */
       wfParams?: Record<string, string | number>,
+      /** 用户消息的来源通道（见 runTurnUnchecked 同名参数） */
+      channel?: ChannelStamp,
+      /** 已经落过盘的附件引用（群聊 / 渠道入站；见 runTurnUnchecked 同名参数） */
+      known?: { images?: MessageImage[]; files?: MessageFile[] },
     ) => {
       /*
        * 空文本 + 带附件（纯图片 / 纯文件）也是合法消息：气泡（MessageBubble 只在
        * 有字时才画文字泡）与历史组装（agent/history 只在 context 有值时才带）都为
        * 「只发图」留好了位置——门只拦「什么都没有」的那条。
        */
-      if (!text.trim() && !(pending?.length || files?.length)) return
+      if (!text.trim() && !(pending?.length || files?.length || known?.images?.length || known?.files?.length)) return
       if (!hasApiKey(loadAiSettings())) {
         if (!hidden) onNeedKeyRef.current()
         return
       }
-      // 任何一轮真正开始，该会话布防的自启动（team.awake）当场失效（见 agentTeam/delegations）
-      onAgentTeamTurnStarted(target.conversationId)
+      // 任何一轮真正开始，该会话积压的通道消息不再触发自启动
       const chain = turnChainRef.current
       const prev = chain.get(target.conversationId)
       let release!: () => void
@@ -517,7 +582,7 @@ export function useAgent(opts: {
       chain.set(target.conversationId, ticket)
       try {
         if (prev) await prev
-        await runTurnUnchecked(target, text, hidden, context, quote, pending, files, mark, isCompactTurn, modules, wfParams)
+        await runTurnUnchecked(target, text, hidden, context, quote, pending, files, mark, isCompactTurn, modules, wfParams, channel, known)
       } finally {
         release()
         if (chain.get(target.conversationId) === ticket) chain.delete(target.conversationId)
@@ -544,8 +609,18 @@ export function useAgent(opts: {
    * 那里的每一段都挂在目标上、写进 {目标}/chat.json，自由聊天没有目标可挂。
    */
   const sendFree = useCallback(
-    (conversationId: string, text: string, opts?: { files?: PendingFile[]; images?: PendingImage[] }) => {
+    (
+      conversationId: string,
+      text: string,
+      opts?: {
+        files?: PendingFile[]
+        images?: PendingImage[]
+        /** Work 通道交付：role 空闲时由交付唤醒，不当作新的用户发言 */
+        delivery?: { text: string; stamp: ChannelStamp; envelopeId: string }
+      },
+    ) => {
       const trimmed = text.trim()
+      const delivery = opts?.delivery
       const docFiles = (opts?.files ?? []).filter((x) => !x.image)
       const imageFiles: PendingImage[] = [
         ...(opts?.images ?? []),
@@ -553,15 +628,14 @@ export function useAgent(opts: {
           .filter((x) => x.image)
           .map((x) => ({ id: x.id, name: x.name, bytes: x.bytes, file: x.image as File, previewUrl: '' })),
       ]
-      // 允许纯图片或纯文件发送（无字放行）
-      if (!trimmed && !docFiles.length && !imageFiles.length) return
+      // 允许纯图片或纯文件发送（无字放行）；Work 交付与附件无关，直接放行
+      if (!delivery && !trimmed && !docFiles.length && !imageFiles.length) return
       if (!freeConversationById(conversationId)) return
       if (!hasApiKey(loadAiSettings())) {
         onNeedKeyRef.current()
         return
       }
-      // 任何一轮真正开始，该会话布防的自启动（team.awake）当场失效
-      onAgentTeamTurnStarted(conversationId)
+      // 任何一轮真正开始：该会话积压的通道消息在这里消费
       const chain = turnChainRef.current
       const prev = chain.get(conversationId)
       let release!: () => void
@@ -587,6 +661,8 @@ export function useAgent(opts: {
             setTps,
             setLiveUsage,
             abortMapRef,
+            workManager: getOrCreateFreeWorkManager(conversationId),
+            ...(delivery ? { delivery } : {}),
           })
         } finally {
           release()
@@ -598,7 +674,7 @@ export function useAgent(opts: {
     },
     // 后面列的全是跨渲染稳定的 ref / setState：列进依赖不改变记忆化行为
     // （getLatest / set 维持不列——原实现如此，见 lint 的既有告警）
-    [setStreaming, setRunning, setTps, setLiveUsage, turnChainRef, abortMapRef, namingRef],
+    [setStreaming, setRunning, setTps, setLiveUsage, turnChainRef, abortMapRef, namingRef, getOrCreateFreeWorkManager],
   )
 
   // 动作入口（send / runWorkflow / compactNow / autoTeach / runHidden / resumeInterrupted，
@@ -623,11 +699,59 @@ export function useAgent(opts: {
       const id = convId ?? conversationId
       if (!id) return
       abortMapRef.current.get(id)?.abort()
-      // 子代理在后台跑：停止这一轮时把当前对话所有在跑的一并中断（级联）
-      subManagersRef.current.get(id)?.abortAll()
+      // work 在后台跑：停止这一轮时把当前对话所有在跑的一并中断（级联）
+      workManagersRef.current.get(id)?.abortAll()
     },
     // 两个都是跨渲染稳定的 ref：列进依赖不改变记忆化行为
-    [conversationId, abortMapRef, subManagersRef],
+    [conversationId, abortMapRef, workManagersRef],
+  )
+
+  /**
+   * 停止某个 work 正在跑的那一轮：只认这一个 work，不碰 role 的对话，
+   * 也不连坐同目录下别的 work。work 已经空闲时是 no-op。
+   */
+  const stopWork = useCallback(
+    (workId: string, convId?: string) => {
+      const id = convId ?? conversationId
+      if (!id) return
+      const work = getLatest()
+        .conversations.find((c) => c.id === id)
+        ?.works?.sessions.find((w) => w.id === workId)
+      if (!work) return
+      workManagersRef.current.get(id)?.api.stop(work.name)
+    },
+    [conversationId, getLatest, workManagersRef],
+  )
+
+  /**
+   * UI 的「终止并通知 role」：关闭 loop，同时把用户写的终止声明发到 role 的
+   * Work 通道并唤醒 role。强制终止仍走 stopWork，不碰 role 的上下文。
+   */
+  const stopWorkWithStatement = useCallback(
+    (workId: string, statement: string, convId?: string) => {
+      const id = convId ?? conversationId
+      if (!id) return
+      const work = getLatest()
+        .conversations.find((c) => c.id === id)
+        ?.works?.sessions.find((w) => w.id === workId)
+      if (!work) return
+      workManagersRef.current.get(id)?.stopWithStatement(work.name, statement)
+    },
+    [conversationId, getLatest, workManagersRef],
+  )
+
+  /** 删除 work 会话：管理器会先停 loop，再把它从账本里摘掉。 */
+  const deleteWork = useCallback(
+    (workId: string, convId?: string) => {
+      const id = convId ?? conversationId
+      if (!id) return
+      const work = getLatest()
+        .conversations.find((c) => c.id === id)
+        ?.works?.sessions.find((w) => w.id === workId)
+      if (!work) return
+      workManagersRef.current.get(id)?.api.kill(work.name)
+    },
+    [conversationId, getLatest, workManagersRef],
   )
 
   /* ---------- 等待队列：导师在跑时用户发出去的消息排在这里（见 learn/agentQueue） ---------- */
@@ -644,105 +768,125 @@ export function useAgent(opts: {
     stop,
   })
 
-  /* ---------- 智能体团队委托（team.*）的宿主派发器 ---------- */
+  /* ---------- role/work 三通道（user / agent / work）的宿主派发器 ---------- */
 
   /**
-   * 委托注册表（learn/agentTeam/delegations）只管账，**启动一轮**永远是宿主的事：
-   * 目标声部的会话走 runTurn（隐藏指令 + 分界条 mark，前缀与用户消息同一套纪律，
-   * target.voice 按声部装配提示词与能力面），自由聊天走 sendFree（它没有隐藏机制，
-   * 委托指令以可见消息进入）。
-   * 目标会话解析（resolveTargetConversation）：按发起方所在的目标解析——导师 = 该目标
-   * 最新的导师会话；承接声部 = 各自的工作会话（没有就给确定性 id，见
-   * learn/agentTeam/voiceConvs）；仅聊天 = 最近活跃的那段（不挂目标）。
-   * 经 getter 取用——teamHostRef 每次渲染刷新一份，注册表每次都拿到最新闭包
-   * （与 uiRef / effortGuard 探针同一条纪律）。
+   * 通道注册表（learn/roleWork/dispatch）只管落账、排队与唤醒，**启动一轮**永远是宿主的事：
+   * 目标 role 的会话走 runTurn（target.voice 按 role 装配提示词与能力面）。
+   * 目标会话解析：同一目标下该 role 最新的一段会话；导师没给目标时退回界面当前会话。
+   * 经 getter 取用——dispatcherRef 每次渲染刷新一份，注册表每次都拿到最新闭包。
    */
-  const teamHostRef = useRef<AgentTeamDispatcher | null>(null)
+  const dispatcherRef = useRef<RoleWorkDispatcher | null>(null)
+  /**
+   * 运行态从 true → false 时补一次通道收口：`settleTurn` 里立即 flush 读到的还是旧
+   * running 状态；等 React 提交后再扫一遍，保证运行中排队的 Work 交付一定起下一轮。
+   */
+  const prevRunningRef = useRef<Record<string, boolean>>({})
   useEffect(() => {
-    teamHostRef.current = {
+    const prev = prevRunningRef.current
+    for (const id of Object.keys(prev)) {
+      if (prev[id] && !running[id]) flushChannelInbox(id)
+    }
+    prevRunningRef.current = running
+  }, [running])
+  useEffect(() => {
+    dispatcherRef.current = {
       isConversationRunning: (convId) => Boolean(running[convId]),
-      resolveTargetConversation: (agent, goalId, fromAgent) => {
-        // 委托承接：**按委托者分会**（dv:<承接>:<委托者>:<goal>，同委托者复用同一段；
-        // 见 learn/agentTeam/voiceConvs）。free 没有确定性会话，维持「最近活跃」口径。
-        if (agent !== 'free' && fromAgent && goalId) {
-          return delegationConversationId(goalId, agent, fromAgent)
-        }
-        if (agent === 'free') {
-          let best: string | null = null
-          let bestTs = -1
-          for (const c of getFreeConversations()) {
-            const ts = Math.max(c.updatedAt ?? 0, c.createdAt ?? 0)
-            if (ts >= bestTs) {
-              bestTs = ts
-              best = c.id
-            }
-          }
-          return best
-        }
-        // 导师：给了目标按目标解析（委托分诊的口径），没给退回界面当前会话
-        if (agent === 'tutor' && !goalId) return conversationId
-        return resolveVoiceConversation(getLatest(), agent, goalId)
-      },
-      startTurn: ({ conversationId: convId, kind, delegation }) => {
-        // 启动即令该会话布防的自启动失效（awake 的「期间启动过则失效」）
-        onAgentTeamTurnStarted(convId)
+      resolveRoleConversation: (role, gid) => findRoleConversation(getLatest(), role, gid),
+      startRoleTurn: (req) => {
         if (!hasApiKey(loadAiSettings())) return
-        const text = delegationTurnText(kind, delegation)
-        const conv = conversationById(getLatest(), convId)
-        /**
-         * 这一轮的声部：目标会话存在就以**会话**为准（voiceOfConversation 会从确定性 id
-         * 愈合漏标的声部——会话是身份的最终事实源）；会话还不存在（承接声部的首轮）才按
-         * 委托的两端认（process/remind 是承接方、deliver 是委托方），自启动轮兜导师。
-         * 仅聊天没有隐藏机制，走 sendFree。
-         */
-        const voice = conv
-          ? voiceOfConversation(conv)
-          : delegation
-            ? (kind === 'deliver' ? delegation.fromAgent : delegation.toAgent)
-            : 'tutor'
-        if (voice === 'free') {
-          sendFree(convId, text)
+        if (req.role === 'free') {
+          if (!freeConversationById(req.conversationId)) return
+          void sendFree(req.conversationId, '', {
+            delivery: { text: req.text, stamp: req.stamp, envelopeId: req.envelopeId },
+          })
           return
         }
-        const goal = conv?.goalId ?? delegation?.goalId
+        const conv = conversationById(getLatest(), req.conversationId)
+        const goal = req.goalId ?? conv?.goalId
         if (!goal) return
-        const mark =
-          kind === 'process' ? '委托' : kind === 'remind' ? '委托提醒' : kind === 'deliver' ? '委托交付' : '自启动'
+        const voice: AgentVoice = req.role
         void runTurn(
           {
             goalId: goal,
-            nodeId: delegation?.nodeId ?? null,
-            conversationId: convId,
+            nodeId: null,
+            conversationId: req.conversationId,
             voice,
           },
-          text,
-          true,
+          req.text,
+          false,
           undefined,
           undefined,
           undefined,
           undefined,
-          mark,
+          req.mark,
+          false,
+          undefined,
+          undefined,
+          req.stamp,
+          req.images?.length || req.files?.length
+            ? { ...(req.images?.length ? { images: req.images } : {}), ...(req.files?.length ? { files: req.files } : {}) }
+            : undefined,
         )
+      },
+      appendChannel: (convId, envelope) => {
+        const cur = conversationById(getLatest(), convId)
+        if (cur) {
+          persist({ ...cur, channels: [...(cur.channels ?? []), envelope].slice(-200), updatedAt: Date.now() })
+          return
+        }
+        const free = freeConversationById(convId)
+        if (free) {
+          mutateFreeConversation(convId, (c) => ({
+            ...c,
+            channels: [...(c.channels ?? []), envelope].slice(-200),
+            updatedAt: Date.now(),
+          }))
+        }
+      },
+      /**
+       * 静默汇报：只把消息写进目标会话的上下文与通道流水，不启动一轮、不进排队。
+       * 通道流水由 deliverInbound 先落过，这里只补 `messages` 里的那一条 user 侧消息；
+       * 下一轮组历史时它带 channel stamp 出现，模型能看到这段进度。
+       */
+      appendSilentInbound: (req, _envelope) => {
+        const message = inboundMessage(req.text, req.stamp, {
+          ...(req.images ? { images: req.images } : {}),
+          ...(req.files ? { files: req.files } : {}),
+          ...(req.hidden ? { hidden: true } : {}),
+          ...(req.mark ? { mark: req.mark } : {}),
+          ...(req.delivery ? { delivery: req.delivery } : {}),
+        })
+        const cur = conversationById(getLatest(), req.conversationId)
+        if (cur) {
+          persist({ ...cur, messages: [...cur.messages, message], updatedAt: Date.now() })
+          return
+        }
+        const free = freeConversationById(req.conversationId)
+        if (free) {
+          mutateFreeConversation(req.conversationId, (c) => ({
+            ...c,
+            messages: [...c.messages, message],
+            updatedAt: Date.now(),
+          }))
+        }
       },
     }
   })
   useEffect(() => {
-    setAgentTeamDispatcher(() => teamHostRef.current)
-    return () => setAgentTeamDispatcher(null)
+    setRoleWorkDispatcher(() => dispatcherRef.current)
+    return () => setRoleWorkDispatcher(null)
   }, [])
 
   /**
-   * 当前会话的实时槽。分槽之后同一时刻可能有几位导师都在跑，这里只交出
+   * 当前会话的实时槽。分槽之后同一时刻可能有几位 role 都在跑，这里只交出
    * **眼前这一位**的那一份——面板渲染的是激活页签；页签守卫读的是整张表（见下）。
    */
   const streamingLive = conversationId ? (streaming[conversationId] ?? null) : null
   const streamingParts = streamingLive?.parts ?? null
 
-  /**
-   * 子代理视图数据：当前对话的会话列表 + 正在跑的那场的实时输出。
-   * 面板据此画入口按钮（会话数）、弹出列表与子会话视图（实时流式与导师视图同一套渲染）。
-   */
-  const subBucket = conversation?.subagents
+  /** 当前 role 对话下的 work 账本与实时流 */
+  const workBucket = conversation?.works
 
   /**
    * 思考档位唯一性守卫的探针（见 learn/effortGuard）：档位全应用只有全局滑条一份，
@@ -779,8 +923,8 @@ export function useAgent(opts: {
     pendingAskByConv: pendingAsk,
     tpsByConv: tps,
     liveUsageByConv: liveUsage,
-    /** 全部在跑的子代理实时槽（带 conversationId）：每枚页签的 sub 数据各筛各的 */
-    subRunsAll: subRuns,
+    /** 全部在跑的 work 实时槽（带 conversationId）：每枚页签的 work 数据各筛各的 */
+    workRunsAll: workRuns,
     compactingConvId: compactingConv,
     compacting: !!compactingConv,
     /**
@@ -802,23 +946,41 @@ export function useAgent(opts: {
     runWorkflow,
     compactNow,
     stop,
+    stopWork,
+    stopWorkWithStatement,
+    deleteWork,
     /** api.ask 的表单状态与两条出口（由 AgentPanel 渲染成输入框上方的卡片） */
     pendingAsk: conversationId ? (pendingAsk[conversationId] ?? null) : null,
     submitAsk,
     cancelAsk,
+    submitAskById,
+    cancelAskById,
+    expireAskById,
+    setAskHover,
     /** 最近一跳实测的输出速度（tok/s）；没在跑、或服务端没流式回包时为 null */
     tps: conversationId ? (tps[conversationId] ?? null) : null,
     /** 正在跑的这一轮到目前为止的账（每跳 usage 重算）：上下文占用圆环的实时数据源 */
     liveUsage: conversationId ? (liveUsage[conversationId] ?? null) : null,
-    /** 子代理：当前对话的会话与各场在跑任务的实时流（见 docs/subagent-architecture.md） */
-    sub: {
-      sessions: subBucket?.sessions ?? [],
-      // 定义只来自本对话（subagent.create 登记的；面板的会话列表按 defKey 认名字）
-      defs: subBucket?.defs ?? [],
-      running: subRuns.some((r) => r.conversationId === conversationId),
-      live: subRuns
+    /** work：当前 role 对话下的会话与各场在跑任务的实时流 */
+    work: {
+      sessions: workBucket?.sessions ?? [],
+      running: workRuns.some((r) => r.conversationId === conversationId),
+      live: workRuns
         .filter((r) => r.conversationId === conversationId)
-        .map(({ sessionId, runId, parts }) => ({ sessionId, runId, parts })),
+        .map(({ workId, runId, parts }) => ({ workId, runId, parts })),
     },
   }
+}
+
+/** 同一目标下某 role 最新的一段会话；没有就 null（通道投递不自动建会话） */
+function findRoleConversation(
+  store: LearnStore,
+  role: AgentProfileId,
+  goalId?: string | null,
+): string | null {
+  const matches = store.conversations.filter(
+    (c) => roleOfConversation(c) === role && (goalId == null || c.goalId === goalId),
+  )
+  matches.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
+  return matches[0]?.id ?? null
 }

@@ -1,0 +1,325 @@
+/**
+ * role-work 通道流水：入站 / 出站消息的落账、来源戳与聊天层过滤。
+ *
+ * 这里只有纯函数，不碰 store / React：
+ * - role 的 `Conversation.channels` 是外部收发的唯一流水；
+ * - 聊天层只读它（user / agent），所以永远不会把工具与思考露给外部；
+ * - 思维层读 `Conversation.messages`，两者互不污染。
+ */
+import type {
+  ChannelKind,
+  ChannelMessage,
+  ChannelPeer,
+  ChannelStamp,
+  Conversation,
+  ConversationMessage,
+  MessageFile,
+  MessageImage,
+} from '../../agent/types'
+import { displayName } from '../../user/profile'
+import { activeUser } from '../../user/store'
+
+const CHANNEL_CAP = 200
+
+/**
+ * 当前用户的正式显示名：用户模块是唯一的身份来源，通道信封不再写死“用户”。
+ * 用户尚未加载（启动早期 / 无用户作用域）时给一个中性兜底，而不是每次渲染都空着。
+ */
+export function currentUserName(): string {
+  const user = activeUser()
+  return user ? displayName(user.profile, '未命名用户') : '未命名用户'
+}
+
+/** 当前用户作为通道对端（id 也取用户模块，不再固定为字面量 'user'） */
+export function userPeer(): ChannelPeer {
+  const user = activeUser()
+  return {
+    kind: 'user',
+    id: user?.id ?? 'user',
+    name: user ? displayName(user.profile, '未命名用户') : '未命名用户',
+  }
+}
+
+export function peerNameOf(kind: ChannelKind, id: string, fallback: string): string {
+  // 用户的名字只认用户模块：调用方即使还带着历史的字面量「用户」，也不能盖回真名
+  if (kind === 'user') return currentUserName() || fallback
+  if (kind === 'group') return fallback || '群聊'
+  return fallback || id
+}
+
+export function stampLineOf(stamp: ChannelStamp): string {
+  const label =
+    stamp.channel === 'user'
+      ? '用户通道'
+      : stamp.channel === 'agent'
+        ? 'Agent 通道'
+        : stamp.channel === 'group'
+          ? '群聊通道'
+          : 'Work 通道'
+  return '【' + label + ' · ' + stamp.from.name + ' · ' + formatTs(stamp.ts) + '】'
+}
+
+export function formatTs(ts: number): string {
+  const d = new Date(ts)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return (
+    d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+    ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds())
+  )
+}
+
+/**
+ * 通道元信息里的时间：模型上下文要求 `yyyy/MM/dd HH:mm:ss`（与 UI 的 `-` 格式分开）。
+ * 单独一个函数是为了不把「人看的格式」与「模型读的协议」混在一处改。
+ */
+export function formatMetaTs(ts: number): string {
+  return formatTs(ts).replace(/-/g, '/')
+}
+
+/**
+ * role / work 上下文里每条 user 侧外部消息的**元信息抬头**。
+ *
+ * 形如：
+ * `[{time:2026/11/23 20:45:00, channel:agent, id:e1, roleId:dispatcher, roleName:经理龟}]`
+ *
+ * 字段是约定好的协议，不是给人看的装饰：`roleId` / `roleName` 是**发信人**，
+ * `channel` 是它从哪条通道来。大模型靠这一行分清「这句话是谁说的」，用户消息、
+ * 跨 role 转交、work 交付都走同一套抬头。
+ */
+export function channelMetaLineOf(stamp: ChannelStamp): string {
+  const id = stamp.from.id || '-'
+  const name = stamp.from.name || '-'
+  const envelopeId = stamp.envelopeId || '-'
+  return (
+    '[{time:' + formatMetaTs(stamp.ts) +
+    ', channel:' + stamp.channel +
+    ', id:' + envelopeId +
+    ', roleId:' + id +
+    ', roleName:' + name +
+    (stamp.mention ? ', mention:self' : '') +
+    '}]'
+  )
+}
+
+/** 模型历史里的通道正文：与 runtime 注入必须逐字节一致 */
+export function channelTextOf(stamp: ChannelStamp, text: string): string {
+  return channelMetaLineOf(stamp) + '\n' + text
+}
+
+/** 给一条 role 会话追加通道流水；超过上限只保留最近的（旧消息仍在 messages 里） */
+export function withChannel(conv: Conversation, message: ChannelMessage): Conversation {
+  const channels = [...(conv.channels ?? []), message].slice(-CHANNEL_CAP)
+  return { ...conv, channels, updatedAt: Date.now() }
+}
+
+/** 一条入站通道消息对应的角色上下文消息（正文保持纯文本，来源戳由 history 补） */
+export function inboundMessage(
+  text: string,
+  stamp: ChannelStamp,
+  extra?: Pick<ConversationMessage, 'images' | 'files' | 'hidden' | 'mark' | 'delivery'>,
+): ConversationMessage {
+  return {
+    id: crypto.randomUUID(),
+    role: 'user',
+    parts: [{ type: 'text', text }],
+    ts: stamp.ts,
+    channel: stamp,
+    ...(extra?.images ? { images: extra.images } : {}),
+    ...(extra?.files ? { files: extra.files } : {}),
+    ...(extra?.hidden ? { hidden: true } : {}),
+    ...(extra?.mark ? { mark: extra.mark } : {}),
+    ...(extra?.delivery ?? stamp.delivery ? { delivery: extra?.delivery ?? stamp.delivery } : {}),
+  }
+}
+
+/** 私聊层只展示用户通道；Agent 通道属于内部协作，群聊另开一层，Work 通道放在思维层 */
+export function chatChannelsOf(conv: Conversation): ChannelMessage[] {
+  return (conv.channels ?? []).filter((m) => m.kind === 'user')
+}
+
+/**
+ * 按 id 找 role 会话里的一条用户消息。
+ *
+ * 模型在上下文里看到的是通道抬头里的 `id:`，那是**信封 id**（群聊里就是群消息 id，
+ * 形如 `g-...`），不是 `ConversationMessage.id`。role 把抬头 id 原样交给 work.send /
+ * chat.send 时，两条 id 必须都能命中，否则「附件在眼前却转发不出去」。
+ */
+export function conversationMessageById(
+  messages: ConversationMessage[],
+  id: string,
+): ConversationMessage | null {
+  const key = id.trim()
+  if (!key) return null
+  return messages.find((m) => m.id === key || m.channel?.envelopeId === key) ?? null
+}
+
+/**
+ * 把转存后的附件引用回填到已落账的 user 信封。
+ *
+ * 私聊页只读 `Conversation.channels`，而用户发图时 `AgentSlot` 先建信封、后转存；
+ * 不补这一步，气泡永远只有文字（纯附件消息甚至会整条不可见）。
+ */
+export function withEnvelopeAttachments(
+  channels: ChannelMessage[] | undefined,
+  envelopeId: string | undefined,
+  attachments: ChannelMessage['attachments'] | undefined,
+): ChannelMessage[] | undefined {
+  if (!channels || !envelopeId || !attachments) return channels
+  if (!channels.some((m) => m.id === envelopeId)) return channels
+  return channels.map((m) => (m.id === envelopeId ? { ...m, attachments } : m))
+}
+
+/** 转存完成后，把附件引用并回私聊页正在看的那枚 user 信封。 */
+export function withUserEnvelopeAttachments(
+  conv: Conversation,
+  stamp: ChannelStamp | undefined,
+  images: MessageImage[],
+  files: MessageFile[],
+): Conversation {
+  if (stamp?.channel !== 'user' || (!images.length && !files.length)) return conv
+  const attachments: NonNullable<ChannelMessage['attachments']> = {
+    ...(images.length ? { images } : {}),
+    ...(files.length ? { files } : {}),
+  }
+  const channels = withEnvelopeAttachments(conv.channels, stamp.envelopeId, attachments)
+  if (channels === conv.channels) return conv
+  return { ...conv, channels, updatedAt: Date.now() }
+}
+
+/**
+ * 旧数据的自愈：早期私聊只把附件写进 messages，channels 的 user 信封没有 attachments，
+ * 于是重启后气泡永远是纯文字。这里按 `channel.envelopeId` 把同一轮消息里的引用补回信封；
+ * 幂等，已有 attachments 的信封不动。
+ */
+export function backfillUserEnvelopeAttachments(
+  channels: ChannelMessage[] | undefined,
+  messages: ConversationMessage[],
+): ChannelMessage[] | undefined {
+  if (!channels?.length) return channels
+  let changed = false
+  const next = channels.map((m) => {
+    if (m.kind !== 'user' || m.direction !== 'in' || m.attachments) return m
+    const source = messages.find(
+      (msg) =>
+        msg.role === 'user' &&
+        msg.channel?.channel === 'user' &&
+        msg.channel.envelopeId === m.id &&
+        ((msg.images?.length ?? 0) > 0 || (msg.files?.length ?? 0) > 0),
+    )
+    if (!source) return m
+    changed = true
+    return {
+      ...m,
+      attachments: {
+        ...(source.images?.length ? { images: source.images } : {}),
+        ...(source.files?.length ? { files: source.files } : {}),
+      },
+    }
+  })
+  return changed ? next : channels
+}
+
+/** 群聊的固定对端：`to` 用它表示「这条消息进群」，抄送名单另看 cc */
+export const GROUP_PEER_ID = 'group'
+
+export function groupPeer(): ChannelPeer {
+  return { kind: 'group', id: GROUP_PEER_ID, name: '群聊' }
+}
+
+export function peerOf(kind: ChannelKind, id: string, name: string): ChannelPeer {
+  const peerKind: ChannelPeer['kind'] =
+    kind === 'user' ? 'user' : kind === 'agent' ? 'role' : kind === 'group' ? 'group' : 'work'
+  return { kind: peerKind, id, name }
+}
+
+/** 构造一条出站通道消息（宿主写时间戳与来源，模型不能改） */
+export function outboundEnvelope(input: {
+  channel: ChannelKind
+  from: ChannelPeer
+  to: ChannelPeer
+  text: string
+  /** 宿主指定 id（群聊评论串需要先知道根消息 id）；缺省随机 */
+  id?: string
+  ts?: number
+  attachments?: ChannelMessage['attachments']
+  quoteMessageId?: string
+  auto?: boolean
+  cc?: ChannelPeer[]
+  /** 唯一被激活的 mention */
+  mention?: ChannelPeer
+  /** 交付账（work 交付经 role 转发到通道） */
+  delivery?: ChannelMessage['delivery']
+  goalId?: string
+  threadId?: string
+  threadRootId?: string
+  extra?: ChannelMessage['extra']
+  ask?: ChannelMessage['ask']
+  /** 静默汇报：只入上下文与流水，不启动目标 role 一轮 */
+  silent?: boolean
+}): ChannelMessage {
+  return {
+    id: input.id ?? crypto.randomUUID(),
+    kind: input.channel,
+    direction: 'out',
+    from: input.from,
+    to: input.to,
+    text: input.text,
+    ts: input.ts ?? Date.now(),
+    ...(input.attachments ? { attachments: input.attachments } : {}),
+    ...(input.extra ? { extra: input.extra } : {}),
+    ...(input.ask ? { ask: input.ask } : {}),
+    ...(input.quoteMessageId ? { quoteMessageId: input.quoteMessageId } : {}),
+    ...(input.auto ? { auto: true } : {}),
+    ...(input.cc?.length ? { cc: input.cc } : {}),
+    ...(input.mention ? { mention: input.mention } : {}),
+    ...(input.delivery ? { delivery: input.delivery } : {}),
+    ...(input.goalId ? { goalId: input.goalId } : {}),
+    ...(input.threadId ? { threadId: input.threadId } : {}),
+    ...(input.threadRootId ? { threadRootId: input.threadRootId } : {}),
+    ...(input.silent ? { silent: true } : {}),
+  }
+}
+
+/** 构造一条入站通道消息（用户 / Agent / Work / 群聊发进来） */
+export function inboundEnvelope(input: {
+  channel: ChannelKind
+  from: ChannelPeer
+  to: ChannelPeer
+  text: string
+  ts?: number
+  id?: string
+  attachments?: ChannelMessage['attachments']
+  cc?: ChannelPeer[]
+  /** 唯一被激活的 mention */
+  mention?: ChannelPeer
+  /** 交付账（work 交付经 role 转发到通道） */
+  delivery?: ChannelMessage['delivery']
+  /** 系统自动产生（自动交付 / 异常上报），不是 role 或用户手写 */
+  auto?: boolean
+  goalId?: string
+  threadId?: string
+  threadRootId?: string
+  extra?: ChannelMessage['extra']
+  /** 静默汇报：只入上下文与流水，不启动目标 role 一轮 */
+  silent?: boolean
+}): ChannelMessage {
+  return {
+    id: input.id ?? crypto.randomUUID(),
+    kind: input.channel,
+    direction: 'in',
+    from: input.from,
+    to: input.to,
+    text: input.text,
+    ts: input.ts ?? Date.now(),
+    ...(input.attachments ? { attachments: input.attachments } : {}),
+    ...(input.extra ? { extra: input.extra } : {}),
+    ...(input.cc?.length ? { cc: input.cc } : {}),
+    ...(input.mention ? { mention: input.mention } : {}),
+    ...(input.delivery ? { delivery: input.delivery } : {}),
+    ...(input.auto ? { auto: true } : {}),
+    ...(input.goalId ? { goalId: input.goalId } : {}),
+    ...(input.threadId ? { threadId: input.threadId } : {}),
+    ...(input.threadRootId ? { threadRootId: input.threadRootId } : {}),
+    ...(input.silent ? { silent: true } : {}),
+  }
+}

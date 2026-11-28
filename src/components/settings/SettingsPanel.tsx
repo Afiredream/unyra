@@ -6,8 +6,8 @@
  * 各分页的面板组件与分页清单见本目录（tabs.ts / *Panel.tsx）。
  */
 
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { ArrowLeft, Check, Settings2, Sparkles } from 'lucide-react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import { ArrowLeft, Check } from 'lucide-react'
 import {
   allProviderBaseUrls,
   isConfigured,
@@ -31,6 +31,7 @@ import {
 import { t } from '../../i18n'
 import { type SwitchRootResult } from '../../lib/boot'
 import { AppearancePanel } from './AppearancePanel'
+import { DesignPanel } from './DesignPanel'
 import { ReminderPanel } from './ReminderPanel'
 import { PerformancePanel } from './PerformancePanel'
 import type { ScheduleSound } from '../../learn/schedule'
@@ -58,7 +59,10 @@ interface Props {
   /** 日程铃声（设置 → 提醒）：数据是用户级的 schedule.sound，由工作区传进来 */
   scheduleSound?: ScheduleSound
   onScheduleSoundChange?: (patch: Partial<ScheduleSound>) => void
-  onSwitchSection?: (section: 'general' | 'agent') => void
+  /** 左栏顶部的「常规 / 智能体」切换（由 SettingsPage 注入） */
+  sectionSwitch?: ReactNode
+  /** 用应用自己的文件页签打开外部 TSX；路径由上层转成绝对路径 */
+  onOpenFile?: (rel: string, title?: string) => void
 }
 
 type Page = { view: 'list' } | { view: 'config'; providerId: string }
@@ -72,12 +76,32 @@ type Page = { view: 'list' } | { view: 'config'; providerId: string }
  *   预设不再以「已内置的提供商」形式出现——它们只是创建时的模板。
  * 二级「配置页」：选预设（或自定义兼容格式）→ 名称 → Key → 模型列表。
  */
-export default function SettingsPanel({ onRootChanged, onToast, scheduleSound, onScheduleSoundChange, onSwitchSection }: Props) {
+export default function SettingsPanel({
+  onRootChanged,
+  onToast,
+  scheduleSound,
+  onScheduleSoundChange,
+  sectionSwitch,
+  onOpenFile,
+}: Props) {
   const initial = loadAiSettings()
   const [tab, setTab] = useState<TabKey>(loadSavedTab)
   const [activeSubTab, setActiveSubTab] = useState<string>('theme')
   const [highlightSubTab, setHighlightSubTab] = useState<{ key: string; nonce: number } | null>(null)
   const highlightNonceRef = useRef(0)
+
+  // 课堂页「在设计中管理」等入口通过事件切到设计分页；已打开的设置页也能收到。
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const key = (event as CustomEvent<TabKey>).detail
+      if (!key) return
+      setTab(key)
+      saveTab(key)
+    }
+    window.addEventListener('moji:switch-settings-tab', handler)
+    return () => window.removeEventListener('moji:switch-settings-tab', handler)
+  }, [])
+
   /** 换分页一律走它：选择跟着落盘，下次打开设置还停在这一页 */
   const selectTab = (key: TabKey) => {
     setTab(key)
@@ -118,8 +142,16 @@ export default function SettingsPanel({ onRootChanged, onToast, scheduleSound, o
       saveTab('ai')
       setActiveSubTab('caps')
     }
+    // 顶部分页三击仍保留开发者入口（原先是左栏切换器上的隐藏手势）
+    const onDevEntry = (event: Event) => {
+      if ((event as CustomEvent<string>).detail === 'general') setDevEntry(true)
+    }
     window.addEventListener('moji:open-caps', onOpenCaps as EventListener)
-    return () => window.removeEventListener('moji:open-caps', onOpenCaps as EventListener)
+    window.addEventListener('moji:settings:dev-entry', onDevEntry)
+    return () => {
+      window.removeEventListener('moji:open-caps', onOpenCaps as EventListener)
+      window.removeEventListener('moji:settings:dev-entry', onDevEntry)
+    }
   }, [])
   const [status, setStatus] = useState<StatusState>({ kind: 'idle' })
   const [appearance, setAppearanceState] = useState(loadAppearance)
@@ -261,31 +293,7 @@ export default function SettingsPanel({ onRootChanged, onToast, scheduleSound, o
   return (
     <div className="flex h-full min-h-0 w-full min-w-0 bg-paper">
       <nav className="flex w-[196px] shrink-0 flex-col gap-1 border-r border-line bg-paper-deep px-3 py-3.5 overflow-y-auto select-none">
-        {/* 常规 / Agent 设置 Switch 切换组件 */}
-        <div
-          className="mb-2.5 flex items-center p-0.5 bg-card/60 border border-line rounded-none"
-          title={t('连续三击可解锁开发者模式')}
-          onClick={(e) => {
-            if (e.detail >= 3) setDevEntry(true)
-          }}
-        >
-          <button
-            type="button"
-            onClick={() => onSwitchSection?.('general')}
-            className="flex flex-1 items-center justify-center gap-1.5 py-1 px-2 text-[12px] font-semibold bg-paper text-ink-strong shadow-2xs rounded-none transition"
-          >
-            <Settings2 size={13} className="text-seal shrink-0" />
-            <span>{t('常规')}</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => onSwitchSection?.('agent')}
-            className="flex flex-1 items-center justify-center gap-1.5 py-1 px-2 text-[12px] font-medium text-ink-soft hover:text-ink hover:bg-card/40 rounded-none transition"
-          >
-            <Sparkles size={13} className="text-ink-faint shrink-0" />
-            <span>{t('Agent')}</span>
-          </button>
-        </div>
+        {sectionSwitch ? <div className="mb-1.5 shrink-0">{sectionSwitch}</div> : null}
         {tabs.map((tb) => (
           <div key={tb.key} className="flex flex-col">
             <TabButton
@@ -350,7 +358,9 @@ export default function SettingsPanel({ onRootChanged, onToast, scheduleSound, o
             <h2 className="text-[15px] font-semibold text-ink-strong">
               {tab === 'appearance'
                 ? t('外观')
-                : tab === 'reminder'
+                : tab === 'doc-design'
+                  ? t('设计')
+                  : tab === 'reminder'
                   ? t('提醒')
                 : tab === 'performance'
                   ? t('性能')
@@ -457,6 +467,8 @@ export default function SettingsPanel({ onRootChanged, onToast, scheduleSound, o
             highlightSubTab={highlightSubTab}
             onSubTabChange={setActiveSubTab}
           />
+        ) : tab === 'doc-design' ? (
+          <DesignPanel onToast={onToast} onOpenFile={onOpenFile} />
         ) : tab === 'input' ? (
           <InputPanel onToast={onToast} />
         ) : tab === 'reminder' ? (

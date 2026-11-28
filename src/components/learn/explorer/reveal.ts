@@ -122,7 +122,6 @@ export function revealOfTab(
     case 'sponsors':
     case 'vim':
     case 'guide':
-    case 'classroomShowcase':
       return null
     case 'teach':
       return {
@@ -239,6 +238,7 @@ export function revealOfTab(
     case 'schedule':
     case 'mind':
     case 'agentSettings':
+    case 'prompt':
     case 'agentTeam':
     case 'blank':
     case 'draft':

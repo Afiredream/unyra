@@ -19,6 +19,10 @@ import { flushCommits, flushCommitsSync, setRoot } from './storage'
 import { hydrateUserSettings } from './userSettings'
 import { hydrateUsageLog } from '../ai/usageLog'
 import { hydrateFreeChat } from '../learn/freeChat'
+import { hydrateGroupChat } from '../learn/groupChat'
+import { hydratePromptFiles } from '../agent/promptFileStore'
+import { hydrateExternalAgents } from '../agent/externalAgentStore'
+import { hydrateExternalModules } from './externalModules'
 import { t } from '../i18n'
 import { bootstrapUsers } from '../user/store'
 import { reconcileBackgroundAssets } from '../user/background'
@@ -49,10 +53,19 @@ export async function enterUserScope(uid: string | null): Promise<void> {
   await hydrateUsageLog(uid)
   // 自由聊天的会话同样跟着用户走（users/{uid}/free-chat.json，learn/freeChat）
   await hydrateFreeChat(uid)
+  // 群聊流水同样跟着用户走（users/{uid}/group-chat.json，learn/groupChat）
+  await hydrateGroupChat(uid)
+  // 共用提示词文件库（users/{uid}/prompts/*.xml，兼容旧 .md）也要在页面首帧前就位
+  await hydratePromptFiles(uid)
+  // 外部 agent 目录（users/{uid}/agents/*/agent.json）同样在首帧前载入
+  await hydrateExternalAgents(uid)
   if (uid) {
     await autoMigrateIfNeeded(uid)
   }
   await hydrateLearnStore(uid)
+  // 设计 / 课堂的外部 TSX 组件（users/{uid}/doc-design/*.tsx）：首帧前扫描并开启热更新。
+  // 必须放在 hydrateLearnStore 之后：用户内相对路径依赖 setUserScope(uid)。
+  await hydrateExternalModules()
   startupMark('r:learn-done')
   refreshAppearance()
   /*

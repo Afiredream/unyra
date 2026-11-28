@@ -4,6 +4,8 @@
  * web 页签的活信息（WebTabMeta）、打开的页签（LearnTab）、本地文件（LocalFile）
  * 与收藏（FavoriteRef / FavoriteItem）。本文件不依赖其他 types/ 子模块。
  */
+import type { AgentProfileId } from '../../agent/agentProfile'
+import type { PromptFileLayer } from '../../agent/promptFiles'
 
 /* ---------- 自由页签（像 vscode 那样） ---------- */
 
@@ -100,10 +102,6 @@ export type TabRef =
    */
   | { kind: 'classroom'; classroomId: string; nodeId?: string; goalId?: string }
   /**
-   * 课堂组件与动效库页签：教学语义组件与动画视效库全景速查、实时渲染与动态创作
-   */
-  | { kind: 'classroomShowcase'; tag?: string }
-  /**
    * 用量统计页：同样全局一枚页签（入口在顶栏用户菜单）。它读的是「台账」
    * （ai/usageLog）而不是配置，所以不从设置里走；页面自己订阅台账重渲染。
    */
@@ -127,6 +125,18 @@ export type TabRef =
    * components/agent/AgentSettingsPanel）。同样全局一枚，与全局设置是两份数据。
    */
   | { kind: 'agentSettings' }
+  /**
+   * 内置提示词文件页签（只读）：设置页里的某个内置提示词分段被点开时打开。
+   * 外置提示词不在这里——它就是 prompts/ 下的普通 md，直接用 local 页签编辑。
+   * title 参与显示但不参与身份（tabKey 只看 agent/layer/fileId）。
+   */
+  | {
+      kind: 'prompt'
+      agentId: AgentProfileId
+      layer: PromptFileLayer
+      fileId: string
+      title: string
+    }
   /**
    * 智能体团队页签：多智能体协作中心，左右分栏（左侧群聊/私聊，右侧目标智能体列表与协同大厅）
    */
@@ -153,16 +163,16 @@ export type TabRef =
  * 固定聊天：栏上最左侧那枚**常驻页签**——纯聊天（无系统提示词、无工具、没有人格），
  * 不可关闭与拖拽，不落 store（界面在页签列表前合成置左）；会话住在
  * users/{uid}/free-chat.json（learn/freeChat），conversationId 记当前展示的那一段。
- * 目标级导师：一个目标一枚页签——上下文按目标隔离（graph/conversations），页签里
+ * 目标级 role：一个目标一枚页签——上下文按目标隔离（graph/conversations），页签里
  * 可以在目标的几段对话之间切换（conversationId 记的是**当前展示**的那一段，
  * 为 null 表示还没有会话，激活时现场建）。
- * 子代理会话：页签随时可关（任务在后台继续跑，见 subagent/manager），所以
- * conversationId + sessionId 都要存——会话的渲染数据住在那一段导师对话上。
+ * work 会话：页签随时可关（work 在后台继续跑，见 agent/work/manager），所以
+ * conversationId + workId 都要存——work 的渲染数据住在它所属的那段 role 对话上。
  */
 export type AgentTabRef =
   | { kind: 'free'; conversationId: string | null }
   | { kind: 'goal'; goalId: string; conversationId: string | null }
-  | { kind: 'sub'; conversationId: string; sessionId: string }
+  | { kind: 'work'; conversationId: string; workId: string }
 
 /** 文档区的视图：源码（可编辑）、预览（渲染后）与媒体预览（图片 / 音频 / 视频的本地文件） */
 export type DocView = 'source' | 'preview' | 'media'

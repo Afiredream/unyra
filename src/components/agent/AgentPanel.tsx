@@ -7,17 +7,10 @@ import {
   useState,
   type CSSProperties,
 } from 'react'
-import type {  AgentPart,
-  Conversation,
-  MessageImage,
-  MessageUsage,
-  PendingFile,
-  PendingImage,
-} from '../../agent/types'
+import type { AgentPart, Conversation, MessageImage, MessageUsage, PendingFile, PendingImage, WorkSession } from '../../agent/types'
 import type { AskAnswers, AskFormPayload } from '../../agent/tools'
 import type { PersonaId } from '../../agent/persona'
 import type { DocFormatId } from '../../agent/docFormat'
-import type { SubAgentDef, SubAgentSession } from '../../agent/subagent/types'
 import type { QueuedMessage, SendOutcome } from '../../learn/agentQueue'
 import type { ReasoningEffort } from '../../ai/types'
 import StrategyPicker from './StrategyPicker'
@@ -25,14 +18,23 @@ import { ImageLightbox, PendingLightbox } from './panel/Images'
 import { MsgRail } from './panel/MsgRail'
 import type { MsgAnchor } from './panel/types'
 import { useMessageList } from './panel/useMessageList'
+import { useChatReadIndex } from './panel/messageReadIndex'
 import { ComposerUi } from './panel/useComposerUi'
 import { PaceStrip } from './panel/PaceStrip'
 import { FollowLatestButton } from './panel/MessageBubble'
-import { SubAgentMenu } from './panel/SubAgentMenu'
+import { WorkMenu } from './panel/WorkMenu'
+import { RoleChatView } from './panel/RoleChatView'
+import { MindInspector } from './panel/MindInspector'
+import { mindInspectorVisible } from './panel/mindLayout'
+import type { WorkTimelineMessage } from './panel/MessageList'
 import { toolLabel } from './panel/toolLabel'
 import { useComposer } from './panel/useComposer'
 import { useMsgRail } from './panel/useMsgRail'
 import { useScrollFollow } from './panel/useScrollFollow'
+import { AgentViewTabs, type AgentPanelTab } from './panel/AgentViewTabs'
+import AgentBrowserPage from './panel/AgentBrowserPage'
+import { useAgentBrowserTab } from './panel/useAgentBrowserTab'
+import { setAgentViewMode, useAgentViewMode } from './agentViewMode'
 import { fadeMask, useScrollEdges } from '../../lib/scrollFade'
 import { t, useLocale } from '../../i18n'
 import { focusAgentInput } from '../../lib/agentFocus'
@@ -46,23 +48,30 @@ import { focusAgentInput } from '../../lib/agentFocus'
  * 消息列表见 panel/MessageList、输入区见 panel/Composer（菜单在 panel/PlusMenu）。
  */
 
+/**
+ * 一个 work 会话的 view 数据：会话列表 + 正在跑的实时输出。
+ * work 没有人格，界面只画它的任务上下文与过程。
+ */
+interface WorkView {
+  sessions: WorkSession[]
+  running: boolean
+  live: Array<{ workId: string; runId: string; ts: number; parts: AgentPart[] }>
+}
+
 interface Props {
   conversation: Conversation | null
   conversations: Conversation[]
   streaming: AgentPart[] | null
   /** 自由聊天（固定页签）：没有导师身份——子代理、人格与「正在辅导」全部收起 */
   free?: boolean
-  /** 锁住输入区（不可交流声部的工作会话 / 委托会话）：只能看，发消息要走工作流或委托 */
-  chatLocked?: boolean
-  /** 空态随声部：声部 id（'free' = 仅聊天）与显示名（空白页标题与职责说明跟声部走） */
+  /** 空态随 role：role id（'free' = 仅聊天）与显示名（空白页标题与职责说明跟 role 走） */
   emptyVoice?: string
   emptyName?: string
-  /**
-   * 本会话（委托者视角）发起的、还没收口的委托（activeDelegationsFrom 的快照）：
-   * 在消息列表底部画「委托进行中」条，点击跳转到对应的委托会话。
-   */
-  delegationsOut?: Array<{ id: string; toAgent: string; toName: string; status: 'pending' | 'running'; toConversationId: string }>
-  onOpenDelegation?: (conversationId: string) => void
+  /** 当前 role 的头像 id（agent profile 覆盖后的）；chat 头与消息行用 */
+  agentAvatarId?: string
+  /** 全部 role 的显示名 / 头像 id：一条私聊里可能出现别的 role 的回复，要按 from.id 取 */
+  agentNames?: Partial<Record<string, string>>
+  agentAvatars?: Partial<Record<string, string>>
   /** 轮次进行中那条回复的 id：它在轮次内就分次进了会话（增量落库），列表里要剔掉防止两边都画 */
   streamingMessageId: string | null
   running: boolean
@@ -137,6 +146,12 @@ interface Props {
   ask: { id: string; form: AskFormPayload } | null
   onAskSubmit: (answers: AskAnswers) => void
   onAskCancel: () => void
+  /** 通道气泡内的 ask（含 work 发起、没有进 pendingAsk 槽的那些）按 id 提交 / 取消 / 到期 */
+  onAskSubmitById?: (askId: string, answers: AskAnswers) => void
+  onAskCancelById?: (askId: string) => void
+  onAskExpireById?: (askId: string) => void
+  /** 鼠标在 ask 气泡上悬停 / 移出：暂停或恢复宿主侧的到期计时 */
+  onAskHoverById?: (askId: string, hovering: boolean) => void
   /**
    * 最近一跳实测的输出速度（tok/s，运行时掐表测得）。跑着的时候来自实时上报，
    * 空闲时为 null——状态条会退回用最后一条回复里存的值。
@@ -144,28 +159,19 @@ interface Props {
   tps: number | null
   /** 正在跑的这一轮到目前为止的账（每跳 usage 重算）：圆环的实时数据源，空闲时为 null */
   liveUsage?: MessageUsage | null
+  /** 当前 role 对话下的工作会话列表 + 正在跑的实时输出。 */
+  work?: WorkView
   /**
-   * 子代理（见 docs/subagent-architecture.md）：当前对话的会话列表 + 正在跑的那场的
-   * 实时输出。面板据此画入口按钮、弹出会话列表与子会话视图——子会话的渲染与导师
-   * 视图是同一套（消息列表、工具卡片、流式），只是数据源换掉、输入禁用。
+   * 旧 work 页签带来的初始选中 id：保留兼容，只用于高亮右侧状态面板里的对应 work。
+   * 传 null 就是当前 role 对话本身，不继承上一段的选择。
    */
-  sub?: {
-    sessions: SubAgentSession[]
-    /** 本对话里 subagent.create 登记的定义（会话按 defKey 认名字） */
-    defs: SubAgentDef[]
-    running: boolean
-    /** 每场在跑任务的实时流式（并发时多场同时在跑，按会话挑自己那一份） */
-    live: Array<{ sessionId: string; runId: string; parts: AgentPart[] }>
-  }
-  /**
-   * 子会话视图：看哪个子代理会话由**页签**决定（agent 栏页签化，见 AgentTabStrip）——
-   * 页签指着哪个会话，整个面板就看哪一边。消息列表、流式输出、状态条与定位条的输入
-   * 全部换成子会话那一份——渲染机制与导师视图完全同一套，换的只是数据源；
-   * 传 null 就是导师对话本身。
-   */
-  viewSubId?: string | null
-  /** 子代理会话入口被点：宿主把它的页签开好并置前（替代旧的面板内视图切换） */
-  onOpenSub?: (sessionId: string) => void
+  viewWorkId?: string | null
+  /** 终止某个 work 正在跑的这一轮（只停这一个 work，不动 role 的对话） */
+  onStopWork?: (workId: string) => void
+  /** 带终止声明：停 loop 后把声明发给 role 并激活它 */
+  onStopWorkWithStatement?: (workId: string, statement: string) => void
+  /** 删除 work 会话（会先停 loop，再移除上下文） */
+  onDeleteWork?: (workId: string) => void
   /** 点击文件附件时在标签页打开 */
   onOpenFile?: (pathOrRel: string, title?: string) => void
   onOpenSettings?: () => void
@@ -176,11 +182,11 @@ export default function AgentPanel({
   conversations,
   streaming,
   free,
-  chatLocked,
-  delegationsOut,
-  onOpenDelegation,
   emptyVoice,
   emptyName,
+  agentAvatarId,
+  agentNames,
+  agentAvatars,
   streamingMessageId,
   running,
   hasKey,
@@ -211,14 +217,19 @@ export default function AgentPanel({
   onEditMessage,
   onDeleteMessage,
   onResumeInterrupted,
-  ask,
   onAskSubmit,
   onAskCancel,
+  onAskSubmitById,
+  onAskCancelById,
+  onAskExpireById,
+  onAskHoverById,
   tps,
   liveUsage,
-  sub,
-  viewSubId = null,
-  onOpenSub,
+  work,
+  viewWorkId = null,
+  onStopWork,
+  onStopWorkWithStatement,
+  onDeleteWork,
   active = true,
   onOpenFile,
   onOpenSettings,
@@ -226,6 +237,22 @@ export default function AgentPanel({
   /** 点开看大图的附件。两种来源各一份状态：已进资源库的气泡图与还在内存里的待发送图 */
   const [preview, setPreview] = useState<PendingImage | null>(null)
   const [bubblePreview, setBubblePreview] = useState<MessageImage | null>(null)
+  /** role 视图分层：全局单例，切换 agent 不重置（见 agentViewMode） */
+  const viewMode = useAgentViewMode()
+  /** 当前这段对话自己的后台浏览器；有会话才出现第三个「网页」页签 */
+  const browserTab = useAgentBrowserTab(conversation)
+  const browserPageOpen = browserTab.open && browserTab.sessions.length > 0
+  const activeTab: AgentPanelTab = browserPageOpen ? 'web' : viewMode
+  const selectTab = (tab: AgentPanelTab): void => {
+    if (tab === 'web') {
+      browserTab.setOpen(true)
+      return
+    }
+    browserTab.setOpen(false)
+    setAgentViewMode(tab)
+  }
+  /** 右侧状态面板里高亮 / 定位的 work；WorkMenu 点选时写入，不等于展开某个窗口 */
+  const [activeWorkId, setActiveWorkId] = useState<string | null>(null)
   /** 上下文压缩后的摘要展开着（消息列表里那块分界线上的「看摘要」） */
   const [summaryOpen, setSummaryOpen] = useState(false)
 
@@ -244,27 +271,27 @@ export default function AgentPanel({
     [conversation, streamingMessageId],
   )
 
-  /**
-   * 子会话视图的解析（viewSubId 由页签给，见 Props 的说明）。
-   */
-  const subSession = useMemo(
-    () => (sub && viewSubId ? (sub.sessions.find((s) => s.id === viewSubId) ?? null) : null),
-    [sub, viewSubId],
+  /** chat 层只画 user 通道（与 RoleChatView 的过滤同一口径）：浏览记录要按这个列表数 */
+  const chatMessages = useMemo(
+    () => (conversation?.channels ?? []).filter((m) => m.kind === 'user'),
+    [conversation],
   )
+
   /**
-   * 正看着的这场任务在跑吗（实时流式来自 sub.live 里属于这个会话的那一份）。
-   * 并发模型下过程是边跑边落库的（介入插入前固化一段、收口再固化一段），
-   * 会话消息与实时流式天然不重不漏——不再需要按 runId 剔重的过滤。
+   * 切换 role 会话 / 旧 work 页签时更新右侧面板的选中 work：
+   * 旧 work 页签带着 viewWorkId 进来时高亮对应 work；普通 role 会话不继承上一段的选中。
    */
-  const subLive = useMemo(
-    () => (sub && viewSubId ? (sub.live.find((l) => l.sessionId === viewSubId) ?? null) : null),
-    [sub, viewSubId],
-  )
-  const viewMessages = useMemo(() => (subSession ? subSession.messages : messages), [subSession, messages])
-  const viewStreaming = subSession ? (subLive ? subLive.parts : null) : streaming
-  const viewRunning = subSession ? !!(subLive || subSession.status === 'running') : running
-  /** 子会话头部要显示的定义信息（名字 / 内置标记） */
-  const subDef = subSession ? (sub?.defs ?? []).find((d) => d.key === subSession.defKey) : undefined
+  useEffect(() => {
+    setActiveWorkId(viewWorkId ?? null)
+  }, [conversation?.id, viewWorkId])
+
+  // work 被删 / 换了一段会话后，选中的 id 不能在右侧面板里悬空。
+  useEffect(() => {
+    if (!activeWorkId) return
+    if (work?.sessions.some((w) => w.id === activeWorkId)) return
+    setActiveWorkId(work?.sessions[0]?.id ?? null)
+  }, [work, activeWorkId])
+
   /**
    * 这个对话里所有回复的 token 账，圆环与浮层据此汇总。
    * 跑着的时候把**实时账**追加在最后（每跳 usage 重算）：一轮里模型来回好几跳，
@@ -273,10 +300,10 @@ export default function AgentPanel({
    */
   const usages = useMemo(
     () => [
-      ...viewMessages.flatMap((m) => (m.role === 'assistant' && m.usage ? [m.usage] : [])),
-      ...(!subSession && liveUsage ? [liveUsage] : []),
+      ...messages.flatMap((m) => (m.role === 'assistant' && m.usage ? [m.usage] : [])),
+      ...(liveUsage ? [liveUsage] : []),
     ],
-    [viewMessages, subSession, liveUsage],
+    [messages, liveUsage],
   )
   /**
    * 失活的分界线：从这一条（下标）起还在上下文里，前面的已经被折进摘要、只作显示。
@@ -285,16 +312,65 @@ export default function AgentPanel({
    * 压缩就是「一条原消息都不留 + 摘要成为第一条消息」。全部都失活时给 messages.length
    * （那时摘要下面还没有新消息，分界线画在列表开头，由上面那句 summary 单独渲染）。
    */
-  const summary = subSession ? null : (conversation?.summary ?? null)
+  const summary = conversation?.summary ?? null
   const summaryStart = useMemo(() => {
-    const i = viewMessages.findIndex((m) => !m.retired)
-    return i < 0 ? viewMessages.length : i
-  }, [viewMessages])
+    const i = messages.findIndex((m) => !m.retired)
+    return i < 0 ? messages.length : i
+  }, [messages])
+
+  /** work 消息只做 mind 时间线展示：按会话消息原样取，绝不写回 role 的 messages。 */
+  const workMessages = useMemo<WorkTimelineMessage[]>(() => {
+    const rows: WorkTimelineMessage[] = (work?.sessions ?? []).flatMap((session) =>
+      session.messages
+        .filter((m) => !m.hidden)
+        .map((m, order) => ({ m, workId: session.id, workName: session.name, ts: m.ts, order })),
+    )
+    // 正在跑的 work 还没有落库的增量输出：挂在时间线末尾，仍用同一条 work 标识。
+    for (const live of work?.live ?? []) {
+      const session = work?.sessions.find((item) => item.id === live.workId)
+      if (!session || !live.parts.length) continue
+      rows.push({
+        m: {
+          id: `live:${live.workId}:${live.runId}`,
+          role: 'assistant',
+          ts: live.ts,
+          parts: live.parts,
+        },
+        workId: session.id,
+        workName: session.name,
+        ts: live.ts,
+        order: session.messages.length,
+      })
+    }
+    return rows
+  }, [work])
 
   /* ---------- 定位条、滚动跟随与字号 ---------- */
-
   /** 整块面板：Ctrl + 滚轮的区域就是它（表头、列表、输入区都算，划过哪里都生效） */
   const rootRef = useRef<HTMLDivElement | null>(null)
+  /** 智能体页面宽度：右侧状态面板只在 >= 1400 的宽页出现；窄页把整列让给消息 */
+  const [panelWidth, setPanelWidth] = useState(0)
+  useEffect(() => {
+    const el = rootRef.current
+    if (!el) return
+    // 阈值按整块智能体页面算；不在 AgentSlot 里的调用方退回面板自身宽度。
+    const page = el.closest('[data-agent-slot]')
+    const target = page instanceof HTMLElement ? page : el
+    const sync = (w: number) => {
+      if (Number.isFinite(w) && w > 0) {
+        setPanelWidth((prev) => (prev === Math.round(w) ? prev : Math.round(w)))
+      }
+    }
+    sync(target.clientWidth)
+    if (typeof ResizeObserver === 'undefined') return
+    const ro = new ResizeObserver((entries) => {
+      const w = entries[0]?.contentRect?.width
+      if (typeof w === 'number') sync(w)
+    })
+    ro.observe(target)
+    return () => ro.disconnect()
+  }, [])
+  const showInspector = mindInspectorVisible(viewMode, panelWidth)
   /** 滚动容器：列表、定位条、缩放共用它的实时几何 */
   const scrollRef = useRef<HTMLDivElement | null>(null)
   /**
@@ -322,15 +398,36 @@ export default function AgentPanel({
     pinned,
     jumpToMessage,
     restoreFollow,
+    resetFollow,
     stickToBottom,
     flashId,
     chatScale,
     zoomPct,
     zoomHud,
   } = useScrollFollow(
-    viewMessages,
+    messages,
     { scrollRef, rootRef, msgRefs, railAnchorsRef, contentRef },
     setRailActive,
+  )
+
+  /** resetFollow 每次渲染都是新函数；用 ref 转发，避免把布局 effect 变成每次渲染都跑 */
+  const resetFollowRef = useRef(resetFollow)
+  useLayoutEffect(() => {
+    resetFollowRef.current = resetFollow
+  })
+  // 首次打开 / 切换对话 / 切换对话-思维层 / 从隐藏切回：立刻落到最新一条，不播开场动画。
+  useLayoutEffect(() => {
+    resetFollowRef.current()
+  }, [viewMode, conversation?.id, active])
+
+  /*
+    「回到最新」上的新消息数：按通道记用户读到哪一条（见 panel/messageReadIndex）。
+    chat 层数与 mind 层数是两份不同的浏览进度，通道名分开；贴着底部时恒为 0。
+  */
+  const unread = useChatReadIndex(
+    `role:${conversation?.id ?? ''}:${viewMode}`,
+    viewMode === 'chat' ? chatMessages : messages,
+    pinned,
   )
 
   /*
@@ -345,22 +442,41 @@ export default function AgentPanel({
   /**
    * 跟随状态下，内容每长一点就贴到底部；脱离之后一律不动。
    *
-   * 依赖里除了条数，还有 viewMessages 本身（编辑一条消息、压缩之后换了一整份列表，
+   * 依赖里除了条数，还有 messages 本身（编辑一条消息、压缩之后换了一整份列表，
    * 条数可能没变但高度变了）——只认条数会漏掉这些「不增不减、只是变高」的改动。
+   *
+   * 新增可见消息则无条件回到底部：这是「列表出现新消息」的硬要求；
+   * work 消息也混在同一条时间线里，所以角色消息与 work 两个来源的条数都要看。
    */
+  const lastTimelineCountRef = useRef({
+    role: messages.reduce((n, m) => n + (m.hidden ? 0 : 1), 0),
+    work: workMessages.length,
+    chat: chatMessages.length,
+  })
   useEffect(() => {
-    stickToBottom()
-  }, [stickToBottom, viewMessages, viewStreaming, viewRunning])
+    // 隐藏的提示词注入也会进 messages，但它们不上屏；只把可见行算作「新消息」。
+    const roleCount = messages.reduce((n, m) => n + (m.hidden ? 0 : 1), 0)
+    const prev = lastTimelineCountRef.current
+    const grew =
+      viewMode === 'chat'
+        ? chatMessages.length > prev.chat
+        : roleCount > prev.role || workMessages.length > prev.work
+    lastTimelineCountRef.current = { role: roleCount, work: workMessages.length, chat: chatMessages.length }
+    // 新消息到达就回到底部：即使之前往上翻过，也让最新一条直接可见。
+    // 内容长高 / 流式输出仍走 pinned 的缓动贴底，不打断正在上方阅读的人。
+    if (grew) restoreFollow()
+    else stickToBottom()
+  }, [chatMessages, messages, restoreFollow, stickToBottom, streaming, running, viewMode, workMessages])
 
   // 定位条排在后面：它的 useLayoutEffect 与上面那个「贴底」谁先跑与拆分前一致（见各自注释）
   const { anchors, measureAnchors } = useMsgRail(
-    viewMessages,
+    messages,
     { scrollRef, rootRef, msgRefs, railAnchorsRef },
   )
   // 消息、流式内容一变就重新量一遍（正文还在长，位置一直在动）；容器尺寸变化同理
   useLayoutEffect(() => {
     measureAnchors()
-  }, [measureAnchors, viewStreaming, viewRunning, chatScale])
+  }, [measureAnchors, streaming, running, chatScale])
 
   const composer = useComposer({
     vision,
@@ -414,15 +530,15 @@ export default function AgentPanel({
    * 同样的输入给同样的数，什么时候算、算几次都不影响结果。
    */
   const { turns, tokensTotal, tpsNow } = useMemo(() => {
-    const turns = viewMessages.filter((m) => m.role === 'assistant').length + (viewStreaming ? 1 : 0)
+    const turns = messages.filter((m) => m.role === 'assistant').length + (streaming ? 1 : 0)
     /**
      * 最后一条带 tps 的导师回复。原来是 [...messages].reverse().find(...)：先整份复制再倒着找，
      * 这里改成从后往前的 for——找到的是同一条（倒过来之后的第一个 = 原来最后一个），
      * 也照样跳过 tps 为 0 / 缺失的那些。
      */
     const lastStoredTps = (): number | null => {
-      for (let i = viewMessages.length - 1; i >= 0; i--) {
-        const m = viewMessages[i]
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const m = messages[i]
         if (m.role === 'assistant' && m.usage?.tps) return m.usage.tps
       }
       return null
@@ -430,7 +546,7 @@ export default function AgentPanel({
     // 实时值优先：跑着的时候读这一轮上报的；空闲时退回最后一条回复里存的存量
     const tpsNow = tps ?? lastStoredTps()
     return { turns, tokensTotal: usages.reduce((n, u) => n + u.totalTokens, 0), tpsNow }
-  }, [viewMessages, viewStreaming, usages, tps])
+  }, [messages, streaming, usages, tps])
 
   /**
    * loop 还在跑时，消息列表末尾那行波浪的说明文字。
@@ -445,14 +561,12 @@ export default function AgentPanel({
   // loopLabel 不进 useMemo：纯字符串拼装，一次渲染算两回也花不了几个钱，
   // 而把 locale 塞进依赖数组只会换来一条「多余依赖」的 lint 警告。
   useLocale()
-  const lastStreaming = viewStreaming?.[viewStreaming.length - 1]
+  const lastStreaming = streaming?.[streaming.length - 1]
   const loopLabel =
     lastStreaming && lastStreaming.type === 'tool' && lastStreaming.status === 'running'
       ? t('正在{0}…', toolLabel(lastStreaming.name, lastStreaming.args))
-      : viewStreaming?.length
-        ? subSession
-          ? t('子代理正在准备')
-          : t('导师正在准备')
+      : streaming?.length
+        ? t('角色正在准备')
         : t('思考中…')
 
   const handleSelectPrompt = useCallback(
@@ -463,16 +577,21 @@ export default function AgentPanel({
     [composer],
   )
 
+  /** 点 work 列表 / 输入区入口：只选中右侧面板里的 work（消息已在时间线里） */
+  const openWork = useCallback((workId: string) => {
+    setActiveWorkId(workId)
+  }, [])
+
   // 消息列表那一段 JSX：状态与回调都在上面，这里只负责把它渲染出来
   const messageList = useMessageList({
-    messages: viewMessages,
+    messages,
     goalId: conversation?.goalId,
     summaryStart,
     summary,
     summaryOpen,
     setSummaryOpen,
-    streaming: viewStreaming,
-    running: viewRunning,
+    streaming,
+    running,
     loopLabel,
     flashId,
     msgRefs,
@@ -483,22 +602,31 @@ export default function AgentPanel({
     free,
     emptyVoice,
     emptyName,
+    mind: viewMode === 'mind',
+    agentName: emptyName ?? '',
+    agentAvatarId,
+    workMessages,
+    resetKey: conversation?.id ?? '',
   })
 
   return (
     // relative：定位条贴着这一块的右边挂（它要的是整块面板的坐标，不是消息列的）
-    <div ref={rootRef} className="relative flex h-full min-h-0 flex-col bg-paper-deep/40">
+    <div ref={rootRef} className="relative flex h-full min-h-0 flex-col bg-card/45">
+      <AgentViewTabs
+        active={activeTab}
+        browserCount={browserTab.sessions.length}
+        onSelect={selectTab}
+      />
+      {/* work 的入口在输入区；消息已经按时间戳并入思维时间线，这里不再占一条壳 */}
       {/*
-        内容上限 768px：这一栏的容器可以被拉到 800 宽，两列对调之后还会占住左边那一大块，
-        但对话本身（消息 / 输入区）始终不超过 768——一行拉得太长就读不动了。
-        三段各写一次同一个上限，而不是外面再包一层：这样底色的铺满范围不变，
-        宽出来的部分就是这一栏自己的留白，三段的左右边缘也正好对齐。
-
-        顶栏（超级导师 + 人格 + 「正在辅导」）随 agent 栏页签化撤掉：页签自己就回答着
-        「现在跟谁在说」——目标级页签的标题就是目标的标题，子代理页签就是会话名。
-        「正在辅导」与对话标题搬到了输入框下面的状态行（见下面那一行）。
+        消息区不再限制整栏宽度：对话列表铺满可用空间，只有用户自己的单条气泡限制 450px；
+        mind 的外部消息与 work 消息铺满整行。顶栏（超级导师 + 人格 + 「正在辅导」）随 agent
+        栏页签化撤掉：页签自己就回答着「现在跟谁在说」。
       */}
-      <div className="relative mx-auto min-h-0 w-full max-w-[768px] flex-1">
+      <div className="relative flex min-h-0 w-full flex-1 flex-col">
+        {browserPageOpen && <AgentBrowserPage scope={conversation} active={active} />}
+        <div className={browserPageOpen ? 'hidden' : 'flex min-h-0 w-full flex-1'}>
+          <div className="relative min-w-0 flex-1">
         {/* moji-selectable：聊天列表是全站仅有的两处「可选文字、可拖拽」的区域之一
             （另一处是左侧文档浏览区），见 index.css 的只读界面规则 */}
         {/*
@@ -514,61 +642,42 @@ export default function AgentPanel({
         <div className="h-full" style={listMaskStyle}>
           <div
             ref={scrollRef}
+            data-message-scroll
             onWheel={onWheel}
             onScroll={onScroll}
             // 不显示滚动条（moji-scroll-none），左右内边距对称
-            className="moji-scroll-none moji-selectable h-full overflow-y-auto pb-3 px-3.5"
+            className="moji-scroll-none moji-selectable h-full overflow-y-auto bg-transparent pb-3 px-3.5"
           >
             {/* 字号系数挂在这一层、而不是滚动容器上：滚动条与内边距不该跟着缩放（上边距 20px：列表内容与页签栏之间留一口呼吸） */}
             <div
               ref={contentRef}
-              className={`mx-auto w-full max-w-[768px] pt-5 ${
-                viewMessages.length === 0 && !viewStreaming
+              className={`w-full px-4 pt-5 ${
+                messages.length === 0 && !streaming
                   ? 'flex min-h-[calc(100%-1.25rem)] flex-col justify-center pb-8'
                   : ''
               }`}
               style={{ zoom: chatScale } as CSSProperties}
             >
-              {messageList}
-              {delegationsOut?.length ? (
-                <div
-                  data-delegation-strip
-                  className="mb-2 rounded-xl border border-line bg-card/70 px-3 py-2.5 text-[11.5px]"
-                >
-                  <div className="mb-1.5 flex items-center gap-1.5 font-medium text-ink-strong">
-                    {t('委托进行中')}
-                    <span className="rounded bg-seal/10 px-1.5 py-0.5 text-[10px] font-medium leading-none text-seal-deep dark:text-seal-2">
-                      {delegationsOut.length}
-                    </span>
-                  </div>
-                  <div className="flex flex-col gap-1">
-                    {delegationsOut.map((d) => (
-                      <button
-                        key={d.id}
-                        type="button"
-                        title={t('跳转到它的委托会话')}
-                        onClick={() => onOpenDelegation?.(d.toConversationId)}
-                        className="flex items-center gap-1.5 rounded-lg px-1.5 py-1 text-left text-ink-soft transition hover:bg-line/45 hover:text-ink"
-                      >
-                        <span
-                          aria-hidden="true"
-                          className={
-                            'h-1.5 w-1.5 shrink-0 rounded-full ' +
-                            (d.status === 'running' ? 'animate-pulse bg-seal' : 'bg-line-strong')
-                          }
-                        />
-                        <span className="truncate">
-                          → {d.toName}
-                          <span className="ml-1 text-ink-faint">
-                            （{d.status === 'running' ? t('处理中') : t('排队中')}）
-                          </span>
-                        </span>
-                        <span className="ml-auto shrink-0 text-[10.5px] text-seal">{t('查看委托会话')}</span>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              ) : null}
+              {viewMode === 'chat' ? (
+                <RoleChatView
+                  channels={conversation?.channels ?? []}
+                  agentName={emptyName ?? t('智能体')}
+                  agentAvatarId={agentAvatarId}
+                  agentNames={agentNames}
+                  agentAvatars={agentAvatars}
+                  agentVoice={emptyVoice ?? 'free'}
+                  agentRunning={running}
+                  resetKey={conversation?.id ?? ''}
+                  onAskSubmit={onAskSubmitById}
+                  onAskCancel={onAskCancelById}
+                  onAskExpire={onAskExpireById}
+                  onAskHover={onAskHoverById}
+                  onOpenFile={onOpenFile}
+                  work={work}
+                />
+              ) : (
+                messageList
+              )}
             </div>
           </div>
         </div>
@@ -589,7 +698,22 @@ export default function AgentPanel({
           <span className="text-[13px] font-medium tabular-nums text-ink-strong">{zoomPct}%</span>
         </div>
 
-        {!pinned && <FollowLatestButton onClick={restoreFollow} />}
+        {!pinned && <FollowLatestButton onClick={restoreFollow} unread={unread} className="bottom-3 right-8" />}
+        </div>
+
+        {showInspector && (
+          <MindInspector
+            usages={usages}
+            subject={emptyName ?? undefined}
+            works={work?.sessions ?? []}
+            activeWorkId={activeWorkId}
+            onOpenWork={openWork}
+            onStopWork={onStopWork}
+            onStopWorkWithStatement={onStopWorkWithStatement}
+            onDeleteWork={onDeleteWork}
+          />
+        )}
+      </div>
       </div>
 
       {/* 输入区与列表之间不画分隔线：输入卡片自己那圈边框已经把它分出来了，多一条线只是噪音 */}
@@ -597,17 +721,18 @@ export default function AgentPanel({
         上内边距为 0：输入卡片与上面的消息列表之间只留卡片自己那圈边框，
         上面那一条 10px 的空白把「对话」与「我要说的话」切成了两段，而且它一直是空的。
       */}
-      <div className="mx-auto w-full max-w-[768px] shrink-0 px-3.5 pb-3 pt-0">
-        <ComposerUi
+      <div className={(browserPageOpen ? 'hidden ' : '') + 'w-full shrink-0 px-3.5 pb-3 pt-0'}>
+        {viewMode === 'chat' && (
+          <ComposerUi
           composer={composer}
           running={running}
-          locked={chatLocked}
+          locked={false}
           hasKey={hasKey}
           providerLabel={providerLabel}
           queue={queue}
           onQueueDrop={onQueueDrop}
           onQueueSendNow={onQueueSendNow}
-          ask={ask}
+          ask={null}
           onAskSubmit={onAskSubmit}
           onAskCancel={onAskCancel}
           usages={usages}
@@ -627,11 +752,8 @@ export default function AgentPanel({
           effort={effort}
           onSetEffort={onSetEffort}
           onOpenPreview={setPreview}
-          subMode={subSession ? { name: subDef?.name ?? subSession.defKey, running: viewRunning } : undefined}
-          subAgentSlot={
-            free ? undefined : (
-              <SubAgentMenu sessions={sub?.sessions ?? []} defs={sub?.defs ?? []} onOpen={(id) => onOpenSub?.(id)} />
-            )
+          workSlot={
+            free ? undefined : <WorkMenu sessions={work?.sessions ?? []} onOpen={openWork} />
           }
           // 写作策略入口：输入框底行、子代理按钮右侧（向上展开——它已贴近窗口底缘）
           strategySlot={
@@ -659,7 +781,8 @@ export default function AgentPanel({
           free={free}
           // keepalive：隐藏面板不登记 chip 落点（模块级单槽，谁最后登记谁赢）
           active={active}
-        />
+          />
+        )}
 
         {/*
           状态行：输入框底下的一条细字。左边只放**这段对话叫什么**，右边是轮数 / 速度 / token——
@@ -669,24 +792,7 @@ export default function AgentPanel({
           人格与格式选择器不在这行：它们搬进了输入框底行，与提供商切换同一排（见 ComposerUi 的 strategySlot）。
         */}
         <div className="flex min-w-0 items-center gap-2.5 px-1 pb-1.5 pt-1.5">
-          {subSession ? (
-            <>
-              <span
-                className={'shrink-0 text-[11px] leading-none ' + (viewRunning ? 'text-seal' : 'text-ink-faint')}
-              >
-                {viewRunning
-                  ? t('任务进行中')
-                  : subSession.status === 'interrupted'
-                    ? t('上次被中断')
-                    : subSession.status === 'error'
-                      ? t('上次出错')
-                      : t('空闲')}
-              </span>
-              <span className="min-w-0 truncate text-[11px] leading-none text-ink-faint">
-                {t('独立上下文 · {0} 次任务', subSession.runs)}
-              </span>
-            </>
-          ) : free ? (
+          {free ? (
             <>
               {/*
                 自由聊天没有「正在辅导谁」：这里只放这段对话的名字（同一条起名规矩：
